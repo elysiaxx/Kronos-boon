@@ -1,0 +1,7 @@
+# Extra dependencies for the MT5 accuracy backtest, on top of the repo's
+# base requirements.txt (numpy, pandas, torch, matplotlib, huggingface_hub, ...).
+#
+# MetaTrader5 is Windows-only and talks to a locally installed MT5 terminal.
+# Install it ONLY on the machine that runs the terminal; the CSV path needs
+# nothing extra.
+MetaTrader5>=5.0.45
