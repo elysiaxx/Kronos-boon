@@ -112,7 +112,53 @@ Các chỉ số:
   trưng chu kỳ (phút/giờ/thứ/ngày/tháng) nên không ảnh hưởng miễn là nhất quán.
 * **Volume.** XAUUSD/forex thường không có volume thật (`real_volume = 0`) nên
   dùng `tick_volume`; `amount` để Kronos tự suy ra như mặc định thư viện.
-* **Bước tiếp theo (tùy chọn).** Sau khi đo độ chính xác, có thể dựng vòng
-  *forward-test* đặt lệnh trên tài khoản demo (`order_send`) để kiểm tra trong
-  điều kiện thật — hỏi để mình bổ sung module đó.
+
+---
+
+## 6. Forward-test / giao dịch demo (`live_demo.py`)
+
+Sau khi đo độ chính xác, bạn có thể chạy **vòng lặp realtime**: mỗi khi một
+nến đóng → Kronos dự báo → ra tín hiệu long/short/flat → vào/ra lệnh → ghi log
+equity.
+
+Có 2 trục độc lập:
+
+* `--broker paper` (mặc định) mô phỏng lệnh trong bộ nhớ, **không gửi gì**;
+  `--broker mt5` gửi lệnh thật qua `order_send`.
+* `--feed mt5` lấy nến realtime từ terminal; `--feed replay --csv ...` phát lại
+  một file CSV như thể nến đang về (chạy offline, không cần MT5).
+
+**Chốt an toàn:** mặc định là `paper`; `--broker mt5` bắt buộc đi với
+`--feed mt5`; và `MT5Broker` **từ chối tài khoản real** trừ khi thêm
+`--allow_real`.
+
+Quy trình đề xuất — thử 3 bước từ an toàn đến thật:
+
+```bash
+# 1) Dry-run hoàn toàn offline trên CSV (không cần MT5):
+python -m mt5_backtest.live_demo --broker paper --feed replay \
+    --csv xauusd_m15.csv --symbol XAUUSD --timeframe M15 \
+    --lookback 400 --pred_len 24 --eval_horizon 8 --threshold_pct 0.1 \
+    --volume 0.01 --contract_size 100
+
+# 2) Paper-trade trên dữ liệu LIVE (dữ liệu thật, lệnh mô phỏng):
+python -m mt5_backtest.live_demo --broker paper --feed mt5 \
+    --symbol XAUUSD --timeframe M15 --max_bars 96
+
+# 3) Giao dịch trên tài khoản DEMO thật:
+python -m mt5_backtest.live_demo --broker mt5 --feed mt5 \
+    --symbol XAUUSD --timeframe M15 --volume 0.01 --max_bars 96 \
+    --flatten_on_exit \
+    --mt5_login 1234567 --mt5_password "DEMO_PASS" --mt5_server "YourBroker-Demo"
 ```
+
+Tham số đáng chú ý: `--eval_horizon` (nến dùng để ra tín hiệu), `--threshold_pct`
+(ngưỡng % tối thiểu mới vào lệnh — nhỏ hơn ⇒ giao dịch nhiều hơn), `--volume`
+(khối lượng mỗi lệnh), `--max_bars` / `--duration_min` (điều kiện dừng),
+`--flatten_on_exit` (đóng lệnh khi dừng). Dừng bất cứ lúc nào bằng `Ctrl+C`.
+
+Mỗi quyết định được ghi vào `results/..._trades.csv` (giờ nến, hướng, hành
+động, giá khớp, equity). Chế độ paper in thêm số lệnh đóng, tỉ lệ thắng và % lãi.
+
+> Đây là một chiến lược *tối giản* để kiểm tra chất lượng dự báo trong điều
+> kiện thật, **không phải khuyến nghị đầu tư**. Chỉ dùng trên tài khoản demo.
