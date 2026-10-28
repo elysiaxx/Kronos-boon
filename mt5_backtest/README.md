@@ -162,3 +162,56 @@ Mỗi quyết định được ghi vào `results/..._trades.csv` (giờ nến, h
 
 > Đây là một chiến lược *tối giản* để kiểm tra chất lượng dự báo trong điều
 > kiện thật, **không phải khuyến nghị đầu tư**. Chỉ dùng trên tài khoản demo.
+
+---
+
+## 7. Xem dự báo NGAY TRÊN biểu đồ MT5 (`mt5_visualize.py` + `KronosForecast.mq5`)
+
+MetaTrader 5 không cho Python vẽ lên chart — chỉ **indicator MQL5** chạy trong
+terminal mới vẽ được. Nên ở đây dùng một cầu nối đơn giản:
+
+```
+Python (Kronos)  →  kronos_forecast.csv  →  indicator KronosForecast  →  vẽ lên chart
+```
+
+Python dự báo rồi ghi file CSV vào thư mục **Common\Files** của MT5; indicator
+đọc file đó và vẽ **đường giá đóng cửa dự báo, nến dự báo, dải high/low** nối
+dài sang phải (tương lai), cùng một vạch dọc đánh dấu điểm bắt đầu dự báo.
+
+### Cài indicator (một lần)
+
+1. Mở **MetaEditor** (nút trên MT5, hoặc F4).
+2. Copy `mt5_backtest/mql5/KronosForecast.mq5` vào thư mục
+   `MQL5/Indicators/` (trong MetaEditor: chuột phải *Indicators → Open Folder*).
+3. Chọn file và bấm **Compile** (F7) — ra `KronosForecast.ex5`.
+
+### Chạy
+
+Trên máy Windows, bật Python ghi forecast (tự tìm thư mục Common\Files):
+
+```bash
+# một lần:
+python -m mt5_backtest.mt5_visualize --symbol XAUUSD --timeframe M15 \
+    --lookback 400 --pred_len 24
+
+# cập nhật mỗi khi có nến M15 mới:
+python -m mt5_backtest.mt5_visualize --symbol XAUUSD --timeframe M15 --loop
+```
+
+Trên MT5: mở chart **XAUUSD, khung M15**, kéo indicator **KronosForecast** từ
+*Navigator* vào chart. Dự báo hiện ngay; khi chạy `--loop` nó tự làm mới theo
+`InpRefreshSec` giây.
+
+Tùy chọn của indicator: `InpDrawCandles` (nến dự báo), `InpDrawBand` (dải
+high/low), `InpCloseColor`/`InpLineWidth` (đường close), `InpFile` (tên file —
+phải trùng `--filename` bên Python, mặc định `kronos_forecast.csv`).
+
+### Lưu ý
+
+* **Khớp symbol & khung thời gian** giữa Python và chart, nếu không mốc thời
+  gian dự báo sẽ lệch.
+* Dự báo nằm ở vùng tương lai (bên phải nến cuối). Nếu không thấy, bật **Chart
+  shift** (nút dịch biểu đồ trên thanh công cụ) để chừa khoảng trống bên phải.
+* Thời gian dùng epoch theo **giờ server MT5** để khớp đúng với nến trên chart.
+* Muốn kiểm tra nhanh không cần MT5: ghi file ra chỗ bất kỳ bằng
+  `--feed replay --csv data.csv --out kronos_forecast.csv` rồi tự xem.
