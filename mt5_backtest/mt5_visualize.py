@@ -79,6 +79,64 @@ def write_forecast_csv(path: str, hist: pd.DataFrame, pred_df: pd.DataFrame, per
     return path
 
 
+def find_mt5_common_files() -> list[str]:
+    """Best-effort search for MT5's Common\\Files folder, incl. common Wine
+    locations on macOS. Returns matching directory paths."""
+    import glob
+    home = os.path.expanduser("~")
+    patterns = [
+        # macOS Wine wrappers (broker "MT5 for Mac", PlayOnMac, CrossOver)
+        home + "/Library/Application Support/*/drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/Common/Files",
+        home + "/Library/Application Support/*/drive_c/Program Files*/*/MetaQuotes/Terminal/Common/Files",
+        home + "/Applications/*/drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/Common/Files",
+        # generic Wine prefixes (Linux / mac)
+        home + "/.wine/drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/Common/Files",
+        home + "/.mt5/drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/Common/Files",
+        # native Windows (if ever run there)
+        os.path.expandvars(r"%APPDATA%\MetaQuotes\Terminal\Common\Files"),
+    ]
+    hits = []
+    for pat in patterns:
+        hits.extend(glob.glob(pat))
+    return sorted(set(d for d in hits if os.path.isdir(d)))
+
+
+def run_file_feed(args, predictor, period_sec):
+    """macOS/Linux-friendly loop: watch a bars CSV from KronosExport.mq5, predict,
+    and write the forecast CSV next to it (or to --out)."""
+    bars_path = args.bars_csv
+    if not bars_path:
+        raise SystemExit("--feed file requires --bars_csv <path> (the file KronosExport.mq5 writes). "
+                         "Run with --find_mt5 to locate the Common\\Files folder.")
+    out_path = args.out or os.path.join(os.path.dirname(os.path.abspath(bars_path)), args.filename)
+    print(f"[viz] file feed: watching {bars_path}")
+    print(f"[viz]            writing   {out_path}")
+
+    last_bar_time = None
+    updates = 0
+    while True:
+        if os.path.exists(bars_path):
+            try:
+                df = CSVDataSource(bars_path).fetch(symbol=args.symbol, timeframe=args.timeframe)
+            except Exception as exc:
+                print(f"[viz] skip read ({exc})")
+                df = None
+            if df is not None and len(df) >= args.lookback:
+                cur = df["timestamps"].iloc[-1]
+                if cur != last_bar_time:
+                    last_bar_time = cur
+                    predict_once(predictor, df, args, period_sec, out_path)
+                    updates += 1
+                    if args.max_updates and updates >= args.max_updates:
+                        print("[viz] max_updates reached; stopping.")
+                        break
+        if not args.loop:
+            if updates == 0:
+                print("[viz] (no forecast written yet — bars file missing or too few bars)")
+            break
+        time.sleep(args.poll_sec)
+
+
 def resolve_out_path(args, mt5_source: MT5DataSource | None) -> str:
     if args.out:
         return args.out
@@ -131,10 +189,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--sample_count", type=int, default=1)
     p.add_argument("--seed", type=int, default=None)
     # feed / output
-    p.add_argument("--feed", choices=["mt5", "replay"], default="mt5")
+    p.add_argument("--feed", choices=["mt5", "replay", "file"], default="mt5",
+                   help="mt5: live via MetaTrader5 pkg (Windows). file: watch a bars CSV "
+                        "written by KronosExport.mq5 (works on macOS/Linux). replay: one-shot CSV.")
     p.add_argument("--csv", default=None, help="CSV for --feed replay")
+    p.add_argument("--bars_csv", default=None, help="bars CSV for --feed file (from KronosExport.mq5)")
     p.add_argument("--out", default=None, help="explicit output CSV path (overrides auto-detect)")
     p.add_argument("--filename", default="kronos_forecast.csv", help="file name inside MT5 Common\\Files")
+    p.add_argument("--find_mt5", action="store_true",
+                   help="print candidate MT5 Common\\Files folders (handy on macOS/Wine) and exit")
     # loop
     p.add_argument("--loop", action="store_true", help="refresh on every new closed bar")
     p.add_argument("--poll_sec", type=float, default=5.0)
@@ -149,6 +212,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
+
+    if args.find_mt5:
+        hits = find_mt5_common_files()
+        if hits:
+            print("Candidate MT5 Common\\Files folders:")
+            for d in hits:
+                print("  " + d)
+        else:
+            print("No MT5 Common\\Files folder found automatically.")
+            print("In MT5: File -> Open Data Folder, then go up to Terminal\\Common\\Files.")
+        return
+
     if args.feed == "replay" and not args.csv:
         raise SystemExit("--feed replay requires --csv <path>.")
 
@@ -158,6 +233,10 @@ def main(argv=None):
         import torch, numpy as np
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
+
+    if args.feed == "file":
+        run_file_feed(args, predictor, period_sec)
+        return
 
     if args.feed == "replay":
         src = CSVDataSource(args.csv)

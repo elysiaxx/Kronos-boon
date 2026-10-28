@@ -53,10 +53,31 @@ def timeframe_minutes(timeframe: str) -> int:
     return _TIMEFRAMES[tf][1]
 
 
+def _parse_time_column(s: pd.Series) -> pd.Series:
+    """Parse a timestamp column that may be datetime strings OR an epoch
+    integer (seconds/ms/us/ns, as MT5 / KronosExport write). Magnitude picks
+    the unit so a bare 1.75e9 is read as seconds, not nanoseconds."""
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s
+    num = pd.to_numeric(s, errors="coerce")
+    if num.notna().mean() > 0.99:  # essentially all numeric -> epoch
+        med = float(num.dropna().abs().median())
+        if med > 1e17:
+            unit = "ns"
+        elif med > 1e14:
+            unit = "us"
+        elif med > 1e11:
+            unit = "ms"
+        else:
+            unit = "s"
+        return pd.to_datetime(num, unit=unit)
+    return pd.to_datetime(s)
+
+
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     """Sort, type, validate and trim a frame down to OHLCV_COLUMNS."""
     df = df.copy()
-    df["timestamps"] = pd.to_datetime(df["timestamps"])
+    df["timestamps"] = _parse_time_column(df["timestamps"])
     df = df.sort_values("timestamps").drop_duplicates("timestamps").reset_index(drop=True)
     for col in ("open", "high", "low", "close", "volume"):
         df[col] = pd.to_numeric(df[col], errors="coerce")

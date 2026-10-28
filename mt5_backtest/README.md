@@ -215,3 +215,63 @@ phải trùng `--filename` bên Python, mặc định `kronos_forecast.csv`).
 * Thời gian dùng epoch theo **giờ server MT5** để khớp đúng với nến trên chart.
 * Muốn kiểm tra nhanh không cần MT5: ghi file ra chỗ bất kỳ bằng
   `--feed replay --csv data.csv --out kronos_forecast.csv` rồi tự xem.
+
+---
+
+## 8. Dùng trên macOS (không có package `MetaTrader5`)
+
+Thư viện Python `MetaTrader5` **chỉ chạy trên Windows**. Trên Mac, MT5 chạy qua
+**Wine** (bản "MetaTrader 5 for Mac" của sàn). Vì vậy **`--source mt5` và
+`--broker mt5` không dùng được native trên Mac**. Nhưng Kronos (Python + torch)
+chạy native rất tốt trên Mac (kể cả MPS trên Apple Silicon), và phần **xem dự
+báo trên chart vẫn chạy đầy đủ** qua **cầu nối file**, không cần package đó:
+
+```
+MT5 (Wine) ──KronosExport.mq5──▶ kronos_bars.csv
+                                      │  (Python Kronos native macOS đọc)
+                                      ▼
+                               dự báo bằng Kronos
+                                      │
+                 kronos_forecast.csv ◀┘
+                                      │
+MT5 (Wine) ──KronosForecast.mq5 đọc & vẽ lên chart ◀┘
+```
+
+### Các bước trên Mac
+
+1. **Cài 2 indicator** `KronosExport.mq5` và `KronosForecast.mq5` vào
+   `MQL5/Indicators/` rồi Compile (xem mục 7). Trong MT5: *File → Open Data
+   Folder* để tới thư mục dữ liệu (nằm trong Wine).
+2. **Tìm thư mục `Common\Files`** để Python đọc/ghi:
+   ```bash
+   python -m mt5_backtest.mt5_visualize --find_mt5
+   ```
+   (hoặc trong MT5: *File → Open Data Folder* → lùi ra `Terminal\Common\Files`.)
+3. **Kéo cả 2 indicator** vào chart XAUUSD M15. `KronosExport` sẽ ghi
+   `kronos_bars.csv` vào `Common\Files`.
+4. **Chạy Kronos native trên macOS**, theo dõi file nến và ghi dự báo:
+   ```bash
+   COMMON="/duong/dan/toi/Terminal/Common/Files"   # lấy từ bước 2
+   python -m mt5_backtest.mt5_visualize --feed file \
+       --bars_csv "$COMMON/kronos_bars.csv" \
+       --symbol XAUUSD --timeframe M15 --lookback 400 --pred_len 24 --loop
+   ```
+   `KronosForecast` trên chart sẽ tự vẽ dự báo và cập nhật mỗi nến mới.
+
+### Backtest độ chính xác trên Mac
+
+Cũng dùng file nến đó (hoặc export history từ MT5 ra CSV):
+
+```bash
+python -m mt5_backtest.backtest --source csv \
+    --csv "$COMMON/kronos_bars.csv" --symbol XAUUSD --timeframe M15 \
+    --lookback 400 --pred_len 24 --n_windows 50
+```
+
+### Còn lại gì?
+
+* **Vẽ dự báo + backtest trên Mac: chạy đầy đủ** bằng cầu nối file ở trên.
+* **Đặt lệnh tự động (`order_send`) trên Mac:** cần package Windows-only, nên
+  phải chạy vòng giao dịch trên **Windows VM/VPS**, hoặc viết một EA MQL5 đọc
+  file tín hiệu rồi tự đặt lệnh (thuần trong terminal, không cần Python). Nói
+  một tiếng nếu bạn muốn mình làm EA đó.
