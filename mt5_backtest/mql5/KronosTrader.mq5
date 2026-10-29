@@ -153,7 +153,9 @@ double NormalizeVolume(double volume)
    if(vmax <= 0.0) vmax = InpMaxVolume;
    double v = MathMin(MathMin(volume, InpMaxVolume), vmax);
    v = MathRound(v / step) * step;
-   if(v < vmin) v = vmin;
+   if(v < vmin)
+      return(0.0);          // caller must reject: silently trading vmin could
+                            // be many times the size that was asked for
    return(NormalizeDouble(v, 2));
   }
 //+------------------------------------------------------------------+
@@ -309,6 +311,13 @@ void ProcessSignal()
    if(target != 0)
      {
       double vol = NormalizeVolume(volume);
+      if(vol <= 0.0)
+        {
+         g_last_error = StringFormat("requested volume %.4f is below the symbol minimum %.4f",
+                                     volume, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
+         Print("KronosTrader: ", g_last_error);
+         return;
+        }
       ok = (target > 0) ? g_trade.Buy(vol, _Symbol, 0.0, 0.0, 0.0, "kronos")
                         : g_trade.Sell(vol, _Symbol, 0.0, 0.0, 0.0, "kronos");
       if(ok)
@@ -371,6 +380,10 @@ void WriteStatus()
    FileWriteString(h, StringFormat("autotrading=%d\n",
                    (MQLInfoInteger(MQL_TRADE_ALLOWED) && TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) ? 1 : 0));
    FileWriteString(h, StringFormat("blocked=%d\n", g_blocked ? 1 : 0));
+   FileWriteString(h, StringFormat("volume_min=%.4f\n", SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN)));
+   FileWriteString(h, StringFormat("volume_step=%.4f\n", SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP)));
+   FileWriteString(h, StringFormat("volume_max=%.4f\n", SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX)));
+   FileWriteString(h, StringFormat("volume_cap=%.4f\n", InpMaxVolume));
    FileWriteString(h, StringFormat("pos_side=%d\n", side));
    FileWriteString(h, StringFormat("pos_volume=%.2f\n", pos_vol));
    FileWriteString(h, StringFormat("pos_price=%.5f\n", pos_price));

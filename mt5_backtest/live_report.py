@@ -156,10 +156,15 @@ def compute_stats(data: dict) -> dict:
     exposure = (sum(1 for d in decisions if d["direction"] != 0) / len(decisions)) if decisions else 0.0
     span = _span_hours(decisions)
 
+    realized = sum(pnls)
     return {
         "initial_cash": initial,
         "final_equity": final,
         "net_pnl": final - initial,
+        # What the closed trades actually produced, and what is still floating
+        # in an open position. Only the first is what the p-value describes.
+        "realized_pnl": realized,
+        "unrealized_pnl": (final - initial) - realized,
         "return_pct": ((final - initial) / initial * 100.0) if initial else float("nan"),
         "n_decisions": len(decisions),
         "n_trades": len(pnls),
@@ -238,13 +243,29 @@ def _verdict(stats: dict, session: dict) -> dict:
                           f"đủ để đảo ngược kết quả. Hãy chạy tới ít nhất 30-50 lệnh rồi xem lại. "
                           f"Hiện tại: {stats['wins']} thắng / {stats['losses']} thua."}
 
-    if p is not None and not math.isnan(p) and p < 0.05 and net > 0:
-        level, head = "good", f"Lãi {magnitude} sau {n} lệnh - khác 0 một cách có ý nghĩa thống kê."
-    elif p is not None and not math.isnan(p) and p < 0.05 and net < 0:
-        level, head = "critical", f"Lỗ {magnitude} sau {n} lệnh - khác 0 một cách có ý nghĩa thống kê."
+    # The bootstrap describes the CLOSED trades only. Judging its p-value
+    # against net P&L - which also carries an open position's mark-to-market,
+    # and on a real account every other move in the balance - reported 20
+    # straight losing trades as a statistically significant PROFIT because one
+    # unclosed position happened to be up.
+    realized = stats.get("realized_pnl", net)
+    unrealized = stats.get("unrealized_pnl", 0.0) or 0.0
+    realized_money = f"{_vn(abs(realized))} {cur}".strip()
+    significant = p is not None and not math.isnan(p) and p < 0.05
+    agree = (realized >= 0) == (net >= 0)
+
+    if significant and realized > 0 and agree:
+        level, head = "good", f"Lãi {realized_money} sau {n} lệnh đã đóng - khác 0 một cách có ý nghĩa thống kê."
+    elif significant and realized < 0 and agree:
+        level, head = "critical", f"Lỗ {realized_money} sau {n} lệnh đã đóng - khác 0 một cách có ý nghĩa thống kê."
+    elif significant and not agree:
+        level = "warning"
+        head = (f"{n} lệnh đã đóng cho {'lãi' if realized >= 0 else 'lỗ'} {realized_money} "
+                f"(có ý nghĩa thống kê), nhưng tổng tài khoản lại đang {'lãi' if net >= 0 else 'lỗ'} "
+                f"{magnitude} - hai con số ngược dấu nhau.")
     else:
         level = "warning"
-        head = (f"{'Lãi' if net >= 0 else 'Lỗ'} {magnitude} sau {n} lệnh - "
+        head = (f"{'Lãi' if realized >= 0 else 'Lỗ'} {realized_money} sau {n} lệnh đã đóng - "
                 f"CHƯA phân biệt được với số 0 (may rủi).")
 
     b = stats["per_trade"]
@@ -255,6 +276,9 @@ def _verdict(stats: dict, session: dict) -> dict:
               + (f" ({_vn(stats['max_drawdown_pct'], 1)}%)." if stats["max_drawdown_pct"] else "."))
     if b["ci_low"] < 0 < b["ci_high"]:
         detail += " Khoảng tin cậy trùm qua 0, nên chưa thể nói là có lợi thế."
+    if abs(unrealized) > 1e-9:
+        detail += (f" Ngoài ra còn {_signed_vn(unrealized)} là lãi/lỗ của vị thế CHƯA đóng - "
+                   f"chưa thành hiện thực và không nằm trong thống kê trên.")
     return {"level": level, "headline": head, "detail": detail}
 
 
@@ -344,7 +368,9 @@ _PAGE_JS = r"""
     const list = [
       { label: "Lãi/lỗ ròng", en: "net P&L", value: money(S.net_pnl),
         cls: S.net_pnl >= 0 ? "up" : "down",
-        note: `Vốn ${fmt(S.initial_cash, 0)} → ${fmt(S.final_equity, 2)} (${signed(S.return_pct, 2)}%).` },
+        note: `Vốn ${fmt(S.initial_cash, 0)} → ${fmt(S.final_equity, 2)} (${signed(S.return_pct, 2)}%).`
+              + (Math.abs(S.unrealized_pnl || 0) > 1e-9
+                  ? ` Trong đó ${signed(S.unrealized_pnl, 2)} là vị thế chưa đóng.` : "") },
       { label: "Số lệnh & tỷ lệ thắng", en: "trades / hit rate",
         value: `${S.n_trades} · ${pct(S.hit_rate, 0)}`,
         note: `${S.wins} thắng, ${S.losses} thua. Trung bình thắng ${fmt(S.avg_win, 2)}, thua ${fmt(S.avg_loss, 2)}.`
@@ -360,7 +386,9 @@ _PAGE_JS = r"""
         note: `Khoảng tin cậy 95%: ${signed(b.ci_low, 2)} … ${signed(b.ci_high, 2)}. p = ${fmt(b.p_value, 2)}.` },
       { label: "So với mua & giữ", en: "vs buy & hold", value: money(S.buy_hold_pnl),
         note: `Nếu chỉ mua ở đầu phiên và giữ tới cuối, cùng ${fmt(SES.volume, 2)} lot. `
-              + (S.net_pnl > S.buy_hold_pnl ? "Chiến lược đang hơn." : "Chiến lược đang không hơn.") },
+              + (!Number.isFinite(S.buy_hold_pnl) ? "Chưa đủ dữ liệu để so sánh."
+                 : (S.net_pnl > S.buy_hold_pnl ? "Chiến lược đang hơn." : "Chiến lược đang không hơn."))
+              + (SES.spread > 0 ? " (mua & giữ chưa trừ spread, nên hơi có lợi cho nó.)" : "") },
       { label: "Thời gian trong thị trường", en: "exposure", value: fmt(S.exposure_pct, 0) + "%",
         note: `${S.n_decisions} nến đã xử lý`
               + (S.span_hours ? `, trải ${fmt(S.span_hours, 1)} giờ.` : ".") },

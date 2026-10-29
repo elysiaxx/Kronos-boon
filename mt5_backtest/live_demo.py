@@ -242,49 +242,89 @@ def run_live(args, predictor, broker, logger, fills_log):
                       f"skipping bar {bar_time}", flush=True)
                 continue
 
-            hist = bars.iloc[-args.lookback:]
-            x_ts = hist["timestamps"]
-            stepd = pd.Timedelta(minutes=period)
-            y_ts = pd.Series([bar_time + stepd * (i + 1) for i in range(args.pred_len)])
-            sig = siggen.generate(hist, x_ts, y_ts)
+            try:
+                last_close, steps = _decide_and_act(args, broker, logger, fills_log,
+                                                    bars, bar_time, period, paper, steps)
+            except Exception as exc:
+                # A requote, a stalled terminal, a status file a few seconds
+                # stale - none of those are a reason to end a multi-day run.
+                # Skip the bar, say so, and try again on the next one.
+                print(f"[live] bar {bar_time} skipped: {type(exc).__name__}: {exc}", flush=True)
+                continue
 
-            # The decision is made as this bar closes, so the close is the last
-            # price actually observable at that moment - that is what a paper
-            # fill uses. MT5Broker ignores it and fills on the live tick.
-            last_close = float(hist["close"].iloc[-1])
-            exec_price = last_close if paper else None
-            if paper:
-                broker.mark(last_close)
-            action, fill_price = _act_on_signal(broker, args.symbol, sig, exec_price, bar_time)
-            equity = broker.account_equity()
-            logger.log(bar_time, sig, action, fill_price, equity)
-            fills_log.sync(broker)
-            print(f"[live] {bar_time}  close={last_close:.2f}  dir={sig.direction:+d} "
-                  f"move={sig.expected_move_pct:+.3f}%  {action:12s} equity={equity:.2f}")
-
-            steps += 1
             if args.max_bars and steps >= args.max_bars:
-                print("[live] max_bars reached; stopping.")
+                print("[live] max_bars reached; stopping.", flush=True)
                 break
     except KeyboardInterrupt:
         print("\n[live] interrupted by user.")
     finally:
+        _shutdown_live(args, broker, fills_log, feed, last_close, last_bar_time, period)
+    return steps
+
+
+def _decide_and_act(args, broker, logger, fills_log, bars, bar_time, period, paper, steps):
+    """One bar's decision. Raising here costs this bar, not the run."""
+    hist = bars.iloc[-args.lookback:]
+    x_ts = hist["timestamps"]
+    stepd = pd.Timedelta(minutes=period)
+    y_ts = pd.Series([bar_time + stepd * (i + 1) for i in range(args.pred_len)])
+    sig = siggen.generate(hist, x_ts, y_ts)
+
+    # The decision is made as this bar closes, so the close is the last price
+    # actually observable at that moment - that is what a paper fill uses.
+    # MT5Broker and the file bridge ignore it and fill on the live tick.
+    last_close = float(hist["close"].iloc[-1])
+    exec_price = last_close if paper else None
+    if paper:
+        broker.mark(last_close)
+    try:
+        action, fill_price = _act_on_signal(broker, args.symbol, sig, exec_price, bar_time)
+    finally:
+        # Whatever happened, record what the broker did manage to execute.
+        fills_log.sync(broker)
+    equity = broker.account_equity()
+    logger.log(bar_time, sig, action, fill_price, equity)
+    fills_log.sync(broker)
+    print(f"[live] {bar_time}  close={last_close:.2f}  dir={sig.direction:+d} "
+          f"move={sig.expected_move_pct:+.3f}%  {action:12s} equity={equity:.2f}", flush=True)
+    return last_close, steps + 1
+
+
+def _shutdown_live(args, broker, fills_log, feed, last_close, last_bar_time, period):
+    """Leave nothing running behind us: no open position, no pending target."""
+    try:
         if args.flatten_on_exit:
-            # This runs in a finally, so anything raised here would mask the
-            # real error - and with a real broker it would also hide that a
-            # position is still open.
             try:
-                if not broker.get_position(args.symbol).is_flat:
-                    broker.close_position(args.symbol, last_close, time=datetime.now())
+                flat = broker.get_position(args.symbol).is_flat
+            except Exception:
+                flat = False           # cannot tell -> assume there is one
+            # Stamp the exit in the bars' own time base, not this machine's
+            # clock; mixing the two renders minutes-long trades as hours.
+            exit_time = (last_bar_time + pd.Timedelta(minutes=period)
+                         if last_bar_time is not None else datetime.now())
+            try:
+                if not flat:
+                    broker.close_position(args.symbol, last_close, time=exit_time)
                     print("[live] position flattened on exit.", flush=True)
             except Exception as exc:
-                print(f"[live] COULD NOT FLATTEN ON EXIT: {exc}\n"
-                      f"[live] check {args.symbol} in the terminal - a position may "
+                print(f"[live] COULD NOT FLATTEN ON EXIT: {exc}", flush=True)
+                print(f"[live] check {args.symbol} in the terminal - a position may "
                       f"still be open.", flush=True)
-            finally:
-                fills_log.sync(broker)
-        feed.close()
-    return steps
+            # Even if that failed, cancel any pending non-zero target so the EA
+            # does not open a position minutes after this process is gone.
+            cancel = getattr(broker, "request_flat", None)
+            if cancel is not None:
+                try:
+                    cancel()
+                    print("[live] wrote a flat target so the EA ignores the last signal.",
+                          flush=True)
+                except Exception as exc:
+                    print(f"[live] could not write a flat target: {exc}", flush=True)
+    finally:
+        try:
+            fills_log.sync(broker)
+        finally:
+            feed.close()
 
 
 def _write_session(path: str, session: dict):
@@ -421,6 +461,9 @@ def main(argv=None):
         status = broker._read_status()
         currency = status.get("currency", "")
         args.initial_cash = broker.initial_equity or args.initial_cash
+        # Trade - and report - the size the EA will really place.
+        args.volume = broker.resolve_volume(args.volume)
+        _volume_ctx["volume"] = args.volume
         print(f"[bridge] signal : {signal_path}")
         print(f"[bridge] status : {status_path}")
     else:
@@ -433,6 +476,25 @@ def main(argv=None):
         if info is not None:
             args.initial_cash = float(info.equity)
             currency = info.currency
+
+    # A position left over from a previous run would have its whole round trip
+    # booked as a trade THIS session earned - entry price, entry time and P&L
+    # all from before the session clock started - and its floating P&L is
+    # already inside the equity we just took as the starting capital. Refuse
+    # rather than quietly inherit it.
+    if args.broker in ("file", "mt5"):
+        try:
+            inherited = broker.get_position(args.symbol)
+        except Exception as exc:
+            raise SystemExit(f"Could not read the current position: {exc}")
+        if not inherited.is_flat:
+            raise SystemExit(
+                f"{args.symbol} already has an open {'long' if inherited.side > 0 else 'short'} "
+                f"position of {inherited.volume} lot from before this run.\n"
+                "Close it in the terminal first, then start again - otherwise its P&L would be "
+                "counted as a trade this session produced, and the starting balance would "
+                "already include its floating profit."
+            )
 
     os.makedirs(args.out_dir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

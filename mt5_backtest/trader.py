@@ -483,6 +483,51 @@ class FileSignalBroker:
     def shutdown(self):
         pass
 
+    def resolve_volume(self, volume: float) -> float:
+        """The lot size the EA will actually trade, or refuse to guess.
+
+        The two sides used to disagree in silence: Python wrote the request
+        with two decimals and the EA clamped it to InpMaxVolume and floored it
+        to the symbol minimum. ``--volume 0.001`` became 0.01 (ten times the
+        size asked for) and ``--volume 0.5`` became 0.10 - while the session
+        JSON, and therefore the buy-and-hold benchmark, kept recording the
+        number that was asked for.
+        """
+        status = self._read_status()
+        vmin = self._num(status, "volume_min", 0.01) or 0.01
+        step = self._num(status, "volume_step", vmin) or vmin
+        vmax = self._num(status, "volume_max", 0.0) or float("inf")
+        cap = self._num(status, "volume_cap", 0.0) or float("inf")
+        limit = min(vmax, cap)
+
+        snapped = round(round(volume / step) * step, 8)
+        if snapped < vmin:
+            raise BridgeError(
+                f"--volume {volume} is below the smallest lot this symbol trades "
+                f"({vmin}). Raise it to at least {vmin}."
+            )
+        if snapped > limit:
+            raise BridgeError(
+                f"--volume {volume} exceeds what the EA will place ({limit}; the lower of the "
+                f"symbol maximum and InpMaxVolume). Lower --volume, or raise InpMaxVolume "
+                f"on the EA - and remember it is the stop that keeps a bug from trading big."
+            )
+        if abs(snapped - volume) > 1e-9:
+            print(f"[bridge] volume {volume} snapped to {snapped} "
+                  f"(the symbol trades in steps of {step})")
+        return snapped
+
+    def request_flat(self) -> int:
+        """Publish a flat target without waiting for confirmation.
+
+        A run that dies mid-order leaves the last signal file saying
+        'go long' - and the EA honours it for InpMaxSignalAgeSec (30 min by
+        default), so it can open a real position long after Python is gone.
+        Overwriting the file with target=0 is the one thing still worth doing
+        on the way out, even when the account cannot be read.
+        """
+        return self._write_signal(0, 0.0)
+
     # --- the handshake ---------------------------------------------------
     def _write_signal(self, target: int, volume: float) -> int:
         """Publish the wanted position. Atomic, so the EA never reads a torn row."""
@@ -492,7 +537,7 @@ class FileSignalBroker:
         stamp = int(_time.time() + self._server_offset)
         with open(tmp, "w", encoding="utf-8", newline="") as fh:
             fh.write("id,time,symbol,target,volume\n")
-            fh.write(f"{signal_id},{stamp},{self.symbol},{target},{volume:.2f}\n")
+            fh.write(f"{signal_id},{stamp},{self.symbol},{target},{volume:.4f}\n")
         os.replace(tmp, self.signal_path)
         return signal_id
 

@@ -62,6 +62,7 @@ class FakeEA:
         self.contract_size = 100.0
         self.max_age = 1800
         self.fail_open = False      # close succeeds, the open half is rejected
+        self.volume_cap = 0.10      # mirrors InpMaxVolume
         self.write_status()
 
     # --- the EA's own clock ---------------------------------------------
@@ -76,6 +77,8 @@ class FakeEA:
                 f"server=Broker-Demo\ntrade_mode={self.trade_mode}\ncurrency=USD\n"
                 f"balance={self.equity:.2f}\nequity={self.equity:.2f}\nmargin_free=9000.00\n"
                 f"autotrading={self.autotrading}\nblocked=0\n"
+                f"volume_min=0.0100\nvolume_step=0.0100\nvolume_max=100.0000\n"
+                f"volume_cap={self.volume_cap:.4f}\n"
                 f"pos_side={self.side}\npos_volume={self.volume:.2f}\n"
                 f"pos_price={self.entry:.5f}\npos_time={self.entry_time}\npos_profit=0.00\n"
                 f"last_signal_id={self.last_id}\nlast_action={self.last_action}\n"
@@ -333,6 +336,42 @@ def test_unknown_close_profit_is_not_recorded_as_zero():
         print("  ok: an unreadable close is NaN, never a fake break-even")
 
 
+def test_volume_is_resolved_against_the_symbol_rules():
+    with tempfile.TemporaryDirectory() as tmp:
+        ea = FakeEA(os.path.join(tmp, "sig.csv"), os.path.join(tmp, "st.csv"))
+        b = _broker(tmp, ea).connect()
+
+        assert b.resolve_volume(0.03) == 0.03
+        assert b.resolve_volume(0.014) == 0.01          # snapped to the step, with a notice
+
+        for bad, why in ((0.001, "below"), (0.5, "exceeds")):
+            try:
+                b.resolve_volume(bad)
+                raise AssertionError(f"{bad} lot should have been refused ({why})")
+            except BridgeError as exc:
+                assert why in str(exc), str(exc)
+        print("  ok: an unplaceable lot size is refused, never silently resized")
+
+
+def test_request_flat_cancels_a_pending_target():
+    """A run that dies must not leave a 'go long' signal the EA still honours."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ea = FakeEA(os.path.join(tmp, "sig.csv"), os.path.join(tmp, "st.csv"))
+        b = _broker(tmp, ea).connect()
+        b.wait_sec = 0.2
+        try:
+            b.market_order("XAUUSD", 1, 0.01)      # nothing polls it; times out
+        except BridgeError:
+            pass
+        assert open(ea.signal_path).read().strip().endswith(",1,0.0100"), "expected a long target"
+
+        b.request_flat()                            # what shutdown does on the way out
+        assert open(ea.signal_path).read().strip().endswith(",0,0.0000")
+        ea.poll()
+        assert ea.side == 0, "the EA opened a position from the stale target"
+        print("  ok: a flat target is published so a dead run leaves nothing pending")
+
+
 def test_equity_holds_through_an_unreadable_poll():
     with tempfile.TemporaryDirectory() as tmp:
         ea = FakeEA(os.path.join(tmp, "sig.csv"), os.path.join(tmp, "st.csv"))
@@ -350,7 +389,9 @@ TESTS = [test_open_flip_and_close, test_target_is_idempotent, test_non_utc_serve
          test_close_is_booked_even_when_the_open_half_fails,
          test_signal_ids_continue_from_the_ea,
          test_unknown_close_profit_is_not_recorded_as_zero,
-         test_equity_holds_through_an_unreadable_poll]
+         test_equity_holds_through_an_unreadable_poll,
+         test_request_flat_cancels_a_pending_target,
+         test_volume_is_resolved_against_the_symbol_rules]
 
 if __name__ == "__main__":
     for t in TESTS:
