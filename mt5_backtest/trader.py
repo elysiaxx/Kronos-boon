@@ -40,28 +40,49 @@ class Position:
 
 @dataclass
 class Fill:
-    """Record of one executed market order (for the trade log)."""
+    """Record of one executed market order (for the trade log).
+
+    A ``close`` fill carries the entry it closed, so a round trip can be
+    reconstructed from the fill list alone.
+    """
     time: object
     symbol: str
-    action: str          # 'open_long' / 'open_short' / 'close'
+    action: str          # 'open_long' / 'open_short' / 'close' / 'hold'
     volume: float
     price: float
     realized_pnl: float = 0.0
     comment: str = ""
+    side: int = 0                      # +1 long, -1 short (the position's side)
+    entry_price: float = 0.0           # on a close: where the position was opened
+    entry_time: Optional[object] = None
 
 
 class PaperBroker:
     """In-memory broker. PnL is ``side * (exit - entry) * volume * contract_size``
     in account-currency units (approximate; ``contract_size`` lets you scale it
-    for instruments like XAUUSD where 1 lot = 100 oz)."""
+    for instruments like XAUUSD where 1 lot = 100 oz).
 
-    def __init__(self, initial_cash: float = 10_000.0, contract_size: float = 1.0):
+    ``spread`` is the bid/ask gap in price units (XAUUSD is typically 0.15-0.40
+    USD on a demo account). Every fill is moved half a spread against the
+    trade - buys pay the ask, sells hit the bid - so a round trip costs one
+    full spread. Leaving it at 0 makes a forward test look better than any
+    broker could ever fill it, which is why the reports call that out.
+    """
+
+    def __init__(self, initial_cash: float = 10_000.0, contract_size: float = 1.0,
+                 spread: float = 0.0):
         self.initial_cash = float(initial_cash)
         self.contract_size = float(contract_size)
+        self.spread = float(spread)
         self.realized_pnl = 0.0
+        self.spread_paid = 0.0
         self.position = Position()
         self.fills: list[Fill] = []
         self._last_price = None
+
+    def _exec_price(self, side: int, price: float) -> float:
+        """Price actually filled: buys lift the ask, sells hit the bid."""
+        return float(price) + side * self.spread / 2.0
 
     # --- interface -------------------------------------------------------
     def account_equity(self) -> float:
@@ -85,8 +106,12 @@ class PaperBroker:
         if not self.position.is_flat and self.position.side != side:
             self.close_position(symbol, price, time=time)
         if self.position.is_flat:
-            self.position = Position(side=side, volume=float(volume), entry_price=float(price), entry_time=time)
-            fill = Fill(time, symbol, "open_long" if side == 1 else "open_short", volume, price)
+            exec_price = self._exec_price(side, price)
+            self.spread_paid += abs(exec_price - float(price)) * float(volume) * self.contract_size
+            self.position = Position(side=side, volume=float(volume),
+                                     entry_price=exec_price, entry_time=time)
+            fill = Fill(time, symbol, "open_long" if side == 1 else "open_short",
+                        volume, exec_price, side=side)
             self.fills.append(fill)
             return fill
         # same-direction signal while already in position: hold, no new fill
@@ -96,9 +121,13 @@ class PaperBroker:
         if self.position.is_flat:
             return None
         self.mark(price)
-        pnl = self._pnl(self.position, price)
+        pos = self.position
+        exec_price = self._exec_price(-pos.side, price)   # exiting trades the other way
+        self.spread_paid += abs(exec_price - float(price)) * pos.volume * self.contract_size
+        pnl = self._pnl(pos, exec_price)
         self.realized_pnl += pnl
-        fill = Fill(time, symbol, "close", self.position.volume, price, realized_pnl=pnl)
+        fill = Fill(time, symbol, "close", pos.volume, exec_price, realized_pnl=pnl,
+                    side=pos.side, entry_price=pos.entry_price, entry_time=pos.entry_time)
         self.fills.append(fill)
         self.position = Position()
         return fill

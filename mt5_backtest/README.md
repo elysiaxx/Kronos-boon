@@ -144,42 +144,115 @@ equity.
 
 Có 2 trục độc lập:
 
-* `--broker paper` (mặc định) mô phỏng lệnh trong bộ nhớ, **không gửi gì**;
-  `--broker mt5` gửi lệnh thật qua `order_send`.
-* `--feed mt5` lấy nến realtime từ terminal; `--feed replay --csv ...` phát lại
-  một file CSV như thể nến đang về (chạy offline, không cần MT5).
+* **Lệnh** — `--broker paper` (mặc định) mô phỏng lệnh trong bộ nhớ, **không
+  gửi gì**; `--broker mt5` gửi lệnh thật qua `order_send` (chỉ Windows).
+* **Dữ liệu** — `--feed` chọn nến ở đâu ra:
+
+  | `--feed` | Nguồn nến | Chạy được trên | Cần gì |
+  |---|---|---|---|
+  | `mt5` | terminal MT5 qua package `MetaTrader5` | **chỉ Windows** | MT5 đang mở |
+  | `file` | CSV do `KronosExport.mq5` ghi ra | macOS / Linux / Windows | MT5 (kể cả bản Wine cho Mac) + indicator |
+  | `yahoo` | Yahoo Finance | mọi hệ điều hành | chỉ cần `pip install yfinance` |
+  | `replay` | phát lại một file CSV | mọi hệ điều hành | một file CSV |
 
 **Chốt an toàn:** mặc định là `paper`; `--broker mt5` bắt buộc đi với
 `--feed mt5`; và `MT5Broker` **từ chối tài khoản real** trừ khi thêm
 `--allow_real`.
 
-Quy trình đề xuất — thử 3 bước từ an toàn đến thật:
+### Trên macOS
+
+Package `MetaTrader5` không có bản macOS, nên `--broker mt5` **không chạy được
+native trên Mac** — nhưng bạn vẫn đo được lãi/lỗ thật: lấy giá live từ tài
+khoản demo qua cầu nối file, còn lệnh thì mô phỏng. Chênh lệch so với demo thật
+chỉ là slippage và việc khớp lệnh, đã ghi rõ trong báo cáo.
 
 ```bash
-# 1) Dry-run hoàn toàn offline trên CSV (không cần MT5):
+# Bước 1 (một lần): cài KronosExport.mq5 vào chart XAUUSD M15 — xem mục 7 & 8.
+COMMON=$(python -m mt5_backtest.mt5_visualize --find_mt5 | head -1)
+
+# Bước 2: chạy forward-test trên giá demo thật, trong 24 giờ.
+python -m mt5_backtest.live_demo --broker paper --feed file \
+    --bars_csv "$COMMON/Files/kronos_bars.csv" \
+    --symbol XAUUSD --timeframe M15 \
+    --lookback 400 --pred_len 24 --eval_horizon 8 --threshold_pct 0.15 \
+    --volume 0.01 --contract_size 100 --spread 0.30 \
+    --duration_min 1440 --flatten_on_exit
+```
+
+**Chưa cài MT5?** Chạy ngay bằng dữ liệu Yahoo, không cần tài khoản nào:
+
+```bash
+python -m mt5_backtest.live_demo --broker paper --feed yahoo \
+    --yahoo_ticker GC=F --symbol XAUUSD --timeframe M15 \
+    --lookback 400 --pred_len 24 --eval_horizon 8 --threshold_pct 0.15 \
+    --volume 0.01 --contract_size 100 --spread 0.30 \
+    --duration_min 480 --flatten_on_exit
+```
+
+Dữ liệu Yahoo trễ ~10–15 phút và không có spread của sàn, nên nó đo *chất lượng
+dự báo* chứ không phải điều kiện khớp lệnh. Dùng cầu nối file khi đã có MT5.
+
+### Trên Windows
+
+```bash
+# 1) Dry-run hoàn toàn offline trên CSV:
 python -m mt5_backtest.live_demo --broker paper --feed replay \
     --csv xauusd_m15.csv --symbol XAUUSD --timeframe M15 \
     --lookback 400 --pred_len 24 --eval_horizon 8 --threshold_pct 0.1 \
-    --volume 0.01 --contract_size 100
+    --volume 0.01 --contract_size 100 --spread 0.30
 
 # 2) Paper-trade trên dữ liệu LIVE (dữ liệu thật, lệnh mô phỏng):
 python -m mt5_backtest.live_demo --broker paper --feed mt5 \
-    --symbol XAUUSD --timeframe M15 --max_bars 96
+    --symbol XAUUSD --timeframe M15 --spread 0.30 --max_bars 96
 
-# 3) Giao dịch trên tài khoản DEMO thật:
+# 3) Gửi lệnh thật lên tài khoản DEMO:
 python -m mt5_backtest.live_demo --broker mt5 --feed mt5 \
     --symbol XAUUSD --timeframe M15 --volume 0.01 --max_bars 96 \
     --flatten_on_exit \
     --mt5_login 1234567 --mt5_password "DEMO_PASS" --mt5_server "YourBroker-Demo"
 ```
 
-Tham số đáng chú ý: `--eval_horizon` (nến dùng để ra tín hiệu), `--threshold_pct`
-(ngưỡng % tối thiểu mới vào lệnh — nhỏ hơn ⇒ giao dịch nhiều hơn), `--volume`
-(khối lượng mỗi lệnh), `--max_bars` / `--duration_min` (điều kiện dừng),
-`--flatten_on_exit` (đóng lệnh khi dừng). Dừng bất cứ lúc nào bằng `Ctrl+C`.
+### Tham số đáng chú ý
 
-Mỗi quyết định được ghi vào `results/..._trades.csv` (giờ nến, hướng, hành
-động, giá khớp, equity). Chế độ paper in thêm số lệnh đóng, tỉ lệ thắng và % lãi.
+* `--spread` — chênh lệch mua/bán tính bằng **đơn vị giá** (XAUUSD demo thường
+  0.15–0.40). Mỗi lệnh khớp lệch nửa spread theo hướng bất lợi, nên một vòng
+  mua-bán tốn đúng một spread. **Để mặc định 0 là tự lừa mình:** ở khung M15,
+  spread thường ăn hết phần lớn lợi thế. Lấy đúng con số của sàn bạn dùng.
+* `--eval_horizon` — nến dùng để ra tín hiệu. `--threshold_pct` — ngưỡng % tối
+  thiểu mới vào lệnh (nhỏ hơn ⇒ giao dịch nhiều hơn).
+* `--volume` khối lượng mỗi lệnh, `--contract_size` quy đổi lãi lỗ (XAUUSD: 100
+  oz/lot).
+* `--max_bars` / `--duration_min` điều kiện dừng, `--flatten_on_exit` đóng lệnh
+  khi dừng. Dừng bất cứ lúc nào bằng `Ctrl+C` — mọi file log đã ghi tới đó vẫn
+  đọc được.
+
+### Kết quả: báo cáo lãi/lỗ
+
+Mỗi phiên ghi ra `results/` 4 file cùng tiền tố:
+
+* **`..._report.html` — mở file này.** Đường vốn theo thời gian thật, từng lệnh
+  lãi/lỗ, bảng chi tiết mọi lệnh, nhật ký quyết định từng nến, và phần giải
+  nghĩa. Quan trọng nhất: nó nói thẳng lãi hiện tại **có phân biệt được với may
+  rủi hay không** (bootstrap khoảng tin cậy + p-value), so sánh với mua-và-giữ,
+  và cảnh báo nếu bạn quên khai báo spread.
+* `..._trades.csv` — mỗi nến một dòng: hướng, hành động, giá khớp, equity.
+* `..._fills.csv` — mỗi lệnh khớp một dòng, kèm lãi/lỗ đã chốt.
+* `..._session.json` — cấu hình + tổng kết phiên.
+
+Dựng lại trang HTML bất cứ lúc nào (kể cả khi phiên **đang chạy** hoặc đã bị
+tắt giữa chừng):
+
+```bash
+python -m mt5_backtest.live_report mt5_backtest/results/XAUUSD_M15_paper_file_..._session.json
+```
+
+### Cần chạy bao lâu mới đủ kết luận?
+
+Dưới ~20 lệnh thì con số nào cũng gần như vô nghĩa — một lệnh may mắn đủ đảo
+ngược kết quả, và báo cáo sẽ nói đúng như vậy. Nhắm tới **ít nhất 30–50 lệnh đã
+đóng**. Với XAUUSD M15 và `--threshold_pct 0.15`, thực tế khoảng 1 lệnh mỗi
+2–3 giờ giao dịch, tức cỡ **1–2 tuần** chạy liên tục. Hạ `--threshold_pct` thì
+vào lệnh dày hơn nhưng tín hiệu nhiễu hơn.
 
 > Đây là một chiến lược *tối giản* để kiểm tra chất lượng dự báo trong điều
 > kiện thật, **không phải khuyến nghị đầu tư**. Chỉ dùng trên tài khoản demo.
@@ -301,10 +374,26 @@ python -m mt5_backtest.backtest --source csv --csv gold_m15.csv \
 (`GC=F` là hợp đồng tương lai vàng COMEX — xấp xỉ XAUUSD giao ngay; Yahoo giới
 hạn khung 15m ~60 ngày gần nhất.)
 
+### Forward-test đo lãi/lỗ trên Mac
+
+Cùng cầu nối file đó cũng chạy được vòng forward-test: giá live từ tài khoản
+demo, lệnh mô phỏng, báo cáo lãi/lỗ đầy đủ. Xem mục 6 (`--feed file`).
+
+```bash
+python -m mt5_backtest.live_demo --broker paper --feed file \
+    --bars_csv "$COMMON/kronos_bars.csv" --symbol XAUUSD --timeframe M15 \
+    --spread 0.30 --duration_min 1440 --flatten_on_exit
+```
+
 ### Còn lại gì?
 
-* **Vẽ dự báo + backtest trên Mac: chạy đầy đủ** bằng cầu nối file ở trên.
+* **Vẽ dự báo, backtest và forward-test trên Mac: chạy đầy đủ** bằng cầu nối
+  file ở trên.
 * **Đặt lệnh tự động (`order_send`) trên Mac:** cần package Windows-only, nên
   phải chạy vòng giao dịch trên **Windows VM/VPS**, hoặc viết một EA MQL5 đọc
   file tín hiệu rồi tự đặt lệnh (thuần trong terminal, không cần Python). Nói
   một tiếng nếu bạn muốn mình làm EA đó.
+
+  Khác biệt giữa `--broker paper` trên giá demo và lệnh thật gửi lên demo chỉ
+  là slippage, phí qua đêm và khả năng bị từ chối lệnh — phần dự báo và tín
+  hiệu thì giống hệt, nên để **đo chất lượng mô hình** thì paper là đủ.
