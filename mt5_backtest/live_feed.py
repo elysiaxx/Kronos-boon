@@ -30,7 +30,7 @@ import time
 
 import pandas as pd
 
-from mt5_backtest.data_source import CSVDataSource, MT5DataSource
+from mt5_backtest.data_source import CSVDataSource, MT5DataSource, timeframe_minutes
 
 
 class FeedError(RuntimeError):
@@ -109,39 +109,74 @@ class YahooFeed:
     and carries no spread, so a forward test on it measures the *forecast*,
     not what a broker would have filled. Good enough to start today; use the
     file bridge once MT5 is set up.
+
+    Every read is a full HTTP download, so two things keep it civil:
+
+    * a cache - the loop polls every few seconds, but a 15-minute bar cannot
+      change that fast. Without it a 24h run downloads ~17,000 times and gets
+      itself rate-limited, which then shows up as empty responses.
+    * a right-sized window - asking for 60 days to serve 400 bars moves about
+      six times more data than the run can use.
     """
 
     name = "yahoo"
     can_trade_live = False
 
-    #: Kronos timeframe -> (yfinance interval, how much history to pull)
-    _INTERVALS = {
-        "M1": ("1m", "7d"), "M5": ("5m", "60d"), "M15": ("15m", "60d"),
-        "M30": ("30m", "60d"), "H1": ("1h", "730d"), "D1": ("1d", "10y"),
-    }
+    #: Kronos timeframe -> yfinance interval
+    _INTERVALS = {"M1": "1m", "M5": "5m", "M15": "15m",
+                  "M30": "30m", "H1": "1h", "D1": "1d"}
+    #: how far back Yahoo will serve each interval
+    _MAX_DAYS = {"1m": 7, "5m": 60, "15m": 60, "30m": 60, "1h": 730, "1d": 3650}
 
-    def __init__(self, ticker: str, timeframe: str, symbol: str = None, period: str = None):
+    def __init__(self, ticker: str, timeframe: str, symbol: str = None,
+                 period: str = None, min_refresh_sec: float = 60.0):
         if timeframe not in self._INTERVALS:
             raise ValueError(f"YahooFeed does not support timeframe {timeframe}; "
                              f"pick one of {sorted(self._INTERVALS)}.")
         self.ticker = ticker
         self.timeframe = timeframe
         self.symbol = symbol or ticker
-        self.interval, default_period = self._INTERVALS[timeframe]
-        self.period = period or default_period
+        self.interval = self._INTERVALS[timeframe]
+        self.period = period                  # None => sized from the request
+        self.min_refresh_sec = float(min_refresh_sec)
+        self._cache = None
+        self._cache_at = 0.0
+
+    def _period_for(self, count: int) -> str:
+        """Smallest window that comfortably covers ``count`` closed bars."""
+        if self.period:
+            return self.period
+        tf_min = timeframe_minutes(self.timeframe)
+        # Gold futures trade ~23h a day, 5 days a week; double it for holidays
+        # and half sessions, and never ask for less than 10 days.
+        trading_days = (count * tf_min) / (23 * 60.0)
+        days = max(10, int(trading_days * (7 / 5.0) * 2) + 1)
+        return f"{min(days, self._MAX_DAYS.get(self.interval, 60))}d"
 
     def latest_closed_bars(self, count: int) -> pd.DataFrame:
-        from mt5_backtest.fetch_gold_csv import download, to_kronos_frame
+        from mt5_backtest.fetch_gold_csv import to_kronos_frame
 
-        try:
-            raw = download(self.ticker, self.interval, self.period)
-        except Exception as exc:
-            raise FeedError(f"Yahoo download failed: {exc}") from exc
-        df = to_kronos_frame(raw)
-        if len(df) < 2:
-            raise FeedError(f"Yahoo returned {len(df)} usable bars for {self.ticker}.")
-        # The most recent intraday row is the bar still forming; drop it.
-        df = df.iloc[:-1].reset_index(drop=True)
+        now = time.time()
+        if self._cache is None or now - self._cache_at >= self.min_refresh_sec:
+            from mt5_backtest.fetch_gold_csv import download
+
+            try:
+                raw = download(self.ticker, self.interval, self._period_for(count))
+            except Exception as exc:
+                if self._cache is not None:
+                    # Serve the last good frame; the bar gate will simply wait.
+                    return self._slice(self._cache, count)
+                raise FeedError(f"Yahoo download failed: {exc}") from exc
+            df = to_kronos_frame(raw)
+            if len(df) < 2:
+                raise FeedError(f"Yahoo returned {len(df)} usable bars for {self.ticker}.")
+            # The most recent intraday row is the bar still forming; drop it.
+            self._cache = df.iloc[:-1].reset_index(drop=True)
+            self._cache_at = now
+        return self._slice(self._cache, count)
+
+    @staticmethod
+    def _slice(df: pd.DataFrame, count: int) -> pd.DataFrame:
         return df.iloc[-count:].reset_index(drop=True) if len(df) > count else df
 
     def close(self):

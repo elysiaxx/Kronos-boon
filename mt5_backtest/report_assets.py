@@ -425,24 +425,58 @@ __BODY__
 
 
 def jsonable(o):
-    """JSON fallback: numpy scalars/arrays become plain values, non-finite -> null."""
+    """JSON fallback for types the encoder cannot handle (numpy scalars/arrays)."""
     try:
         import numpy as np
         if isinstance(o, np.generic):
-            return o.item()
+            value = o.item()
+            return None if isinstance(value, float) and not math.isfinite(value) else value
         if isinstance(o, np.ndarray):
-            return o.tolist()
+            return finite_only(o.tolist())
     except Exception:
         pass
-    if isinstance(o, float) and not math.isfinite(o):
-        return None
     return str(o)
+
+
+def finite_only(o):
+    """Replace every non-finite number with None, recursively.
+
+    NaN and Infinity are not JSON. ``json.dumps`` writes them as bare ``NaN`` /
+    ``Infinity`` tokens, which Python reads back happily and every browser's
+    JSON.parse rejects - so a page whose payload holds one dies on its first
+    statement and renders nothing but its server-rendered shell. A ``default=``
+    hook cannot save it either: ``default`` is only consulted for types the
+    encoder cannot serialize, and a float always can be. The scrub has to
+    happen before serialization.
+
+    Statistics go non-finite in ordinary states, not exotic ones: profit factor
+    with no losing trade yet, a bootstrap interval under two trades, a mean of
+    an empty list. Those are exactly the early runs a report is most useful for.
+    """
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: finite_only(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [finite_only(v) for v in o]
+    try:
+        import numpy as np
+        if isinstance(o, np.generic):
+            return finite_only(o.item())
+        if isinstance(o, np.ndarray):
+            return finite_only(o.tolist())
+    except Exception:
+        pass
+    return o
 
 
 def embed_json(data) -> str:
     """Serialize for a <script type="application/json"> block."""
+    # allow_nan=False is the backstop: if anything non-finite survives the
+    # scrub, fail loudly here rather than ship a page that cannot parse.
     # Guard against an early </script> closing the block from inside a string.
-    return json.dumps(data, default=jsonable, ensure_ascii=False).replace("</", "<\\/")
+    return json.dumps(finite_only(data), default=jsonable, ensure_ascii=False,
+                      allow_nan=False).replace("</", "<\\/")
 
 
 def page(title: str, body: str, data, page_js: str) -> str:

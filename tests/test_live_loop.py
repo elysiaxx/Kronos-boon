@@ -109,11 +109,100 @@ def test_transient_errors_are_retried():
     print("  ok: a feed hiccup is retried, not fatal")
 
 
+# --------------------------------------------------------------------------- #
+# YahooFeed: a multi-day run must not hammer the API, nor die when it answers
+# badly once. The two faults compound - the download storm is what provokes the
+# rate-limited empty response in the first place.
+# --------------------------------------------------------------------------- #
+
+def _fake_yahoo(monkey_calls, fail_after=None):
+    """Patch fetch_gold_csv.download with a counter; optionally start failing."""
+    import pandas as pd
+    from mt5_backtest import fetch_gold_csv
+
+    def fake(ticker, interval, period):
+        monkey_calls.append(period)
+        if fail_after is not None and len(monkey_calls) > fail_after:
+            raise fetch_gold_csv.DownloadError("simulated rate limit: no data returned")
+        idx = pd.date_range("2026-10-20", periods=500, freq="15min")
+        return pd.DataFrame({"Open": 1.0, "High": 1.0, "Low": 1.0,
+                             "Close": 1.0, "Volume": 1}, index=idx)
+
+    original = fetch_gold_csv.download
+    fetch_gold_csv.download = fake
+    return original
+
+
+def _restore_yahoo(original):
+    from mt5_backtest import fetch_gold_csv
+    fetch_gold_csv.download = original
+
+
+def test_download_error_is_catchable():
+    """SystemExit inherits BaseException, so `except Exception` would miss it."""
+    from mt5_backtest.fetch_gold_csv import DownloadError
+    assert issubclass(DownloadError, Exception)
+    assert not issubclass(DownloadError, SystemExit)
+    print("  ok: a failed download raises a catchable exception, not SystemExit")
+
+
+def test_yahoo_feed_caches_between_polls():
+    from mt5_backtest.live_feed import YahooFeed
+    calls = []
+    original = _fake_yahoo(calls)
+    try:
+        feed = YahooFeed("GC=F", "M15", min_refresh_sec=3600)
+        for _ in range(20):
+            feed.latest_closed_bars(400)
+        assert len(calls) == 1, f"polled the API {len(calls)} times for one bar"
+        # and the window must be sized to the request, not the 60-day maximum
+        assert calls[0] == "13d", calls[0]
+    finally:
+        _restore_yahoo(original)
+    print("  ok: 20 polls cost one download, over a right-sized window")
+
+
+def test_yahoo_outage_serves_cache_instead_of_dying():
+    from mt5_backtest.live_feed import YahooFeed
+    calls = []
+    original = _fake_yahoo(calls, fail_after=1)
+    try:
+        feed = YahooFeed("GC=F", "M15", min_refresh_sec=0)   # refresh every call
+        first = feed.latest_closed_bars(400)
+        later = feed.latest_closed_bars(400)                 # this one fails
+        assert len(later) == len(first)
+        assert later["timestamps"].iloc[-1] == first["timestamps"].iloc[-1]
+    finally:
+        _restore_yahoo(original)
+    print("  ok: a rate-limited response falls back to the last good frame")
+
+
+def test_yahoo_first_call_failure_is_a_feed_error():
+    """With no cache yet there is nothing to serve - it must be retryable."""
+    from mt5_backtest.live_feed import YahooFeed
+    calls = []
+    original = _fake_yahoo(calls, fail_after=0)
+    try:
+        feed = YahooFeed("GC=F", "M15", min_refresh_sec=0)
+        try:
+            feed.latest_closed_bars(400)
+            raise AssertionError("expected a FeedError")
+        except FeedError as exc:
+            assert "download failed" in str(exc)
+    finally:
+        _restore_yahoo(original)
+    print("  ok: a cold-start failure is a FeedError the loop retries")
+
+
 TESTS = [test_monotonic_feed_passes_everything_through,
          test_stale_bar_is_never_acted_on,
          test_same_bar_is_offered_only_once,
          test_deadline_stops_waiting,
-         test_transient_errors_are_retried]
+         test_transient_errors_are_retried,
+         test_download_error_is_catchable,
+         test_yahoo_feed_caches_between_polls,
+         test_yahoo_outage_serves_cache_instead_of_dying,
+         test_yahoo_first_call_failure_is_a_feed_error]
 
 if __name__ == "__main__":
     for t in TESTS:

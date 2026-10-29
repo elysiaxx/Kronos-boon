@@ -57,18 +57,29 @@ def to_kronos_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out[OHLCV_COLUMNS]
 
 
+class DownloadError(RuntimeError):
+    """A download did not produce usable data (missing package, empty response).
+
+    Deliberately NOT SystemExit: that inherits from BaseException, so an
+    ``except Exception`` around a live feed does not catch it and one empty
+    response - which Yahoo returns when it rate-limits - would kill a
+    multi-day forward test instead of being retried. main() turns it back
+    into SystemExit for a clean CLI message.
+    """
+
+
 def download(ticker: str, interval: str, period: str) -> pd.DataFrame:
     try:
         import yfinance as yf
     except ImportError as exc:
-        raise SystemExit("yfinance is required: pip install yfinance") from exc
+        raise DownloadError("yfinance is required: pip install yfinance") from exc
     raw = yf.download(ticker, interval=interval, period=period,
                       auto_adjust=False, progress=False)
     if raw is None or len(raw) == 0:
-        raise SystemExit(
+        raise DownloadError(
             f"No data returned for {ticker} ({interval}, {period}). "
             "Check the ticker and that the interval/period is allowed by Yahoo "
-            "(15m -> max ~60d, 1h -> max ~730d)."
+            "(15m -> max ~60d, 1h -> max ~730d), or Yahoo is rate-limiting."
         )
     return raw
 
@@ -84,7 +95,10 @@ def main(argv=None):
     p.add_argument("--out", required=True, help="output CSV path")
     args = p.parse_args(argv)
 
-    raw = download(args.ticker, args.interval, args.period)
+    try:
+        raw = download(args.ticker, args.interval, args.period)
+    except DownloadError as exc:
+        raise SystemExit(str(exc))
     df = to_kronos_frame(raw)
     df.to_csv(args.out, index=False)
     print(f"Wrote {len(df)} bars to {args.out}")
