@@ -269,10 +269,20 @@ def run_live(args, predictor, broker, logger, fills_log):
     except KeyboardInterrupt:
         print("\n[live] interrupted by user.")
     finally:
-        if args.flatten_on_exit and not broker.get_position(args.symbol).is_flat:
-            broker.close_position(args.symbol, last_close, time=datetime.now())
-            fills_log.sync(broker)
-            print("[live] position flattened on exit.")
+        if args.flatten_on_exit:
+            # This runs in a finally, so anything raised here would mask the
+            # real error - and with a real broker it would also hide that a
+            # position is still open.
+            try:
+                if not broker.get_position(args.symbol).is_flat:
+                    broker.close_position(args.symbol, last_close, time=datetime.now())
+                    print("[live] position flattened on exit.", flush=True)
+            except Exception as exc:
+                print(f"[live] COULD NOT FLATTEN ON EXIT: {exc}\n"
+                      f"[live] check {args.symbol} in the terminal - a position may "
+                      f"still be open.", flush=True)
+            finally:
+                fills_log.sync(broker)
         feed.close()
     return steps
 
@@ -417,6 +427,12 @@ def main(argv=None):
         broker = MT5Broker(login=args.mt5_login, password=args.mt5_password,
                            server=args.mt5_server, terminal_path=args.mt5_path,
                            allow_real=args.allow_real).connect()
+        # Real equity, not the 10,000 paper default - comparing a live account
+        # against that invents however far apart the two happen to be.
+        info = broker._mt5.account_info()
+        if info is not None:
+            args.initial_cash = float(info.equity)
+            currency = info.currency
 
     os.makedirs(args.out_dir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

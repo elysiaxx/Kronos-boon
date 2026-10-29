@@ -26,6 +26,7 @@ matching the intended use of this tool.
 
 from __future__ import annotations
 
+import math
 import os
 import time as _time
 from dataclasses import dataclass, field
@@ -171,6 +172,9 @@ class MT5Broker:
         self.deviation = deviation
         self.allow_real = allow_real
         self._mt5 = None
+        # Mirrors PaperBroker / FileSignalBroker: without this the fills CSV
+        # comes out empty on Windows and the P&L report has nothing to show.
+        self.fills: list[Fill] = []
 
     def connect(self):
         try:
@@ -280,7 +284,10 @@ class MT5Broker:
         if current.is_flat:
             otype = mt5.ORDER_TYPE_BUY if side == 1 else mt5.ORDER_TYPE_SELL
             res = self._send(symbol, otype, volume, None, "kronos_open")
-            return Fill(time, symbol, "open_long" if side == 1 else "open_short", volume, res.price)
+            fill = Fill(time, symbol, "open_long" if side == 1 else "open_short",
+                        volume, res.price, side=side)
+            self.fills.append(fill)
+            return fill
         return Fill(time, symbol, "hold", 0.0, 0.0)
 
     def close_position(self, symbol: str, price: float = None, time=None) -> Optional[Fill]:
@@ -290,7 +297,26 @@ class MT5Broker:
             return None
         otype = mt5.ORDER_TYPE_SELL if pos.side == 1 else mt5.ORDER_TYPE_BUY
         res = self._send(symbol, otype, pos.volume, pos.ticket, "kronos_close")
-        return Fill(time, symbol, "close", pos.volume, res.price)
+        fill = Fill(time, symbol, "close", pos.volume, res.price,
+                    realized_pnl=self._position_profit(pos.ticket),
+                    side=pos.side, entry_price=pos.entry_price, entry_time=pos.entry_time)
+        self.fills.append(fill)
+        return fill
+
+    def _position_profit(self, position_ticket) -> float:
+        """Realized PnL of a finished position, summed over all of its deals.
+
+        Summing every deal of the position includes the ENTRY's commission, not
+        just the exit's. NaN when the history cannot be read - recording a real
+        round trip as 0.00 would quietly pass as a break-even trade.
+        """
+        try:
+            deals = self._mt5.history_deals_get(position=position_ticket)
+        except Exception:
+            deals = None
+        if not deals:
+            return float("nan")
+        return float(sum(d.profit + d.swap + d.commission for d in deals))
 
     def shutdown(self):
         if self._mt5 is not None:
@@ -335,6 +361,7 @@ class FileSignalBroker:
         self.fills: list[Fill] = []
         self.initial_equity: Optional[float] = None
         self._next_id = 1
+        self._last_equity: Optional[float] = None
         # Server clock minus ours. MT5 server time is usually not UTC, and the
         # EA ages signals against TimeCurrent(), so stamps have to be sent in
         # the server's time base or every signal looks stale on arrival.
@@ -406,7 +433,16 @@ class FileSignalBroker:
                 f"the EA is on {status['symbol']} but this run trades {self.symbol}; "
                 "attach KronosTrader.mq5 to the right chart."
             )
+        # The EA dedupes signals by exact id and remembers the last one it saw.
+        # Restarting Python's counter at 1 would make it ignore this run's first
+        # orders as already-handled, silently - so continue its sequence.
+        seen = int(self._num(status, "last_signal_id", -1))
+        if seen >= self._next_id:
+            self._next_id = seen + 1
+            print(f"[bridge] continuing signal ids from {self._next_id} "
+                  f"(the EA last saw {seen})")
         self.initial_equity = self._num(status, "equity")
+        self._last_equity = self.initial_equity
         print(f"[bridge] EA connected: account={status.get('account')} "
               f"server={status.get('server')} mode={mode} "
               f"equity={self.initial_equity:.2f} {status.get('currency', '')}")
@@ -414,10 +450,15 @@ class FileSignalBroker:
 
     def account_equity(self) -> float:
         try:
-            return self._num(self._read_status(), "equity")
+            equity = self._num(self._read_status(), "equity", float("nan"))
+            if math.isfinite(equity):
+                self._last_equity = equity
+                return equity
         except BridgeError:
-            # Do not kill a multi-day run over one unreadable poll.
-            return float("nan")
+            pass
+        # Do not kill a multi-day run over one unreadable poll, and do not write
+        # a NaN into the equity curve either - hold the last known value.
+        return self._last_equity if self._last_equity is not None else float("nan")
 
     def get_position(self, symbol: str) -> Position:
         status = self._read_status()
@@ -455,6 +496,32 @@ class FileSignalBroker:
         os.replace(tmp, self.signal_path)
         return signal_id
 
+    def _book_close(self, before: Position, status: dict, when) -> Fill:
+        """Record a round trip the EA has reported closing.
+
+        Called the moment the EA stamps the close with our signal id - before
+        any raise. The money has already moved on the account; if the open half
+        of a flip then fails, or the wait times out, the close must still reach
+        the trade log or the measured P&L silently drops a losing trade.
+        """
+        known = status.get("close_profit_known") == "1"
+        fill = Fill(
+            self._server_time(status, "last_time") or when,
+            self.symbol, "close",
+            self._num(status, "close_volume") or before.volume,
+            self._num(status, "close_price"),
+            realized_pnl=self._num(status, "close_profit") if known else float("nan"),
+            side=before.side,
+            entry_price=self._num(status, "close_entry") or before.entry_price,
+            entry_time=self._server_time(status, "close_opened") or before.entry_time,
+        )
+        if not known:
+            print("[bridge] the EA could not read the deal history for this close, "
+                  "so its realized P&L is recorded as unknown rather than as zero",
+                  flush=True)
+        self.fills.append(fill)
+        return fill
+
     def _goto(self, target: int, volume: float, when) -> Optional[Fill]:
         """Ask the EA for a net position and wait until the account shows it."""
         before = self.get_position(self.symbol)
@@ -463,40 +530,45 @@ class FileSignalBroker:
 
         signal_id = self._write_signal(target, volume if target else before.volume)
         deadline = _time.time() + self.wait_sec
-        status = None
+        status, closed, last_error, reached = None, None, "", False
+
         while _time.time() < deadline:
             _time.sleep(self.poll_sec)
             try:
                 status = self._read_status()
             except BridgeError:
                 continue
+            # Book the close as soon as the EA says it belongs to this signal.
+            if closed is None and before.side != 0 and \
+                    int(self._num(status, "close_signal_id", -1)) == signal_id:
+                closed = self._book_close(before, status, when)
+            if status.get("error"):
+                last_error = status["error"]
             if int(self._num(status, "pos_side")) == target:
+                reached = True
                 break
-            err = status.get("error", "")
-            if err and int(self._num(status, "last_signal_id", -1)) == signal_id:
-                raise BridgeError(f"EA rejected signal {signal_id}: {err}")
-        else:
+            # An error is not final while the EA still has retries left, so it
+            # is remembered rather than raised - aborting here used to kill the
+            # run while the EA went on to open a position nobody was watching.
+
+        if not reached:
+            detail = f": {last_error}" if last_error else ""
+            booked = " (its close WAS recorded)" if closed is not None else ""
             raise BridgeError(
                 f"EA did not reach position {target:+d} within {self.wait_sec:.0f}s "
-                f"(signal {signal_id}). Is AutoTrading on and the market open?"
+                f"(signal {signal_id}){detail}{booked}. Check the terminal: "
+                "AutoTrading on, market open, and no position left behind."
             )
 
-        fill_price = self._num(status, "last_price")
-        fill_time = self._server_time(status, "last_time") or when
-
-        # A flip is one signal but two events: book the close, then the open.
-        if before.side != 0:
-            self.fills.append(Fill(
-                fill_time, self.symbol, "close", before.volume, fill_price,
-                realized_pnl=self._num(status, "close_profit"),
-                side=before.side,
-                entry_price=self._num(status, "close_entry") or before.entry_price,
-                entry_time=self._server_time(status, "close_opened") or before.entry_time,
-            ))
+        if closed is None and before.side != 0:
+            closed = self._book_close(before, status, when)
         if target == 0:
-            return self.fills[-1] if self.fills else None
+            return closed
 
-        fill = Fill(fill_time, self.symbol, "open_long" if target == 1 else "open_short",
-                    self._num(status, "pos_volume") or volume, fill_price, side=target)
+        fill = Fill(self._server_time(status, "last_time") or when, self.symbol,
+                    "open_long" if target == 1 else "open_short",
+                    self._num(status, "open_volume") or self._num(status, "pos_volume") or volume,
+                    self._num(status, "open_price") or self._num(status, "pos_price"),
+                    side=target)
         self.fills.append(fill)
         return fill

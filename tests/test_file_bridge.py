@@ -48,13 +48,20 @@ class FakeEA:
         self.entry_time = 0
         self.last_id = -1
         self.last_action = "none"
-        self.last_price = 0.0
+        self.close_signal = -1
+        self.close_price = 0.0
+        self.close_volume = 0.0
         self.close_profit = 0.0
+        self.close_known = 1
         self.close_entry = 0.0
         self.close_opened = 0
+        self.open_signal = -1
+        self.open_price = 0.0
+        self.open_volume = 0.0
         self.error = ""
         self.contract_size = 100.0
         self.max_age = 1800
+        self.fail_open = False      # close succeeds, the open half is rejected
         self.write_status()
 
     # --- the EA's own clock ---------------------------------------------
@@ -72,9 +79,13 @@ class FakeEA:
                 f"pos_side={self.side}\npos_volume={self.volume:.2f}\n"
                 f"pos_price={self.entry:.5f}\npos_time={self.entry_time}\npos_profit=0.00\n"
                 f"last_signal_id={self.last_id}\nlast_action={self.last_action}\n"
-                f"last_price={self.last_price:.5f}\nlast_time={self.now()}\n"
-                f"close_profit={self.close_profit:.2f}\nclose_entry={self.close_entry:.5f}\n"
-                f"close_opened={self.close_opened}\nerror={self.error}\n"
+                f"last_time={self.now()}\n"
+                f"close_signal_id={self.close_signal}\nclose_price={self.close_price:.5f}\n"
+                f"close_volume={self.close_volume:.2f}\nclose_profit={self.close_profit:.2f}\n"
+                f"close_profit_known={self.close_known}\n"
+                f"close_entry={self.close_entry:.5f}\nclose_opened={self.close_opened}\n"
+                f"open_signal_id={self.open_signal}\nopen_price={self.open_price:.5f}\n"
+                f"open_volume={self.open_volume:.2f}\nerror={self.error}\n"
             )
         os.replace(tmp, self.status_path)
 
@@ -105,14 +116,23 @@ class FakeEA:
         if self.side != 0:                      # close first, always
             self.close_profit = self.side * (self.price - self.entry) * self.volume * self.contract_size
             self.close_entry, self.close_opened = self.entry, self.entry_time
+            self.close_signal, self.close_price = sid, self.price
+            self.close_volume = self.volume
             self.equity += self.close_profit
-            self.last_action, self.last_price = "close", self.price
+            self.last_action = "close"
             self.side, self.volume, self.entry = 0, 0.0, 0.0
+            self.error = ""
+            self.write_status()                 # publish the close on its own
         if target != 0:
+            if self.fail_open:                  # a requote / market-closed reject
+                self.error = "open failed: 10018 market closed"
+                self.write_status()
+                return
             self.side, self.volume = target, volume
             self.entry, self.entry_time = self.price, self.now()
+            self.open_signal, self.open_price = sid, self.price
+            self.open_volume = volume
             self.last_action = "open_long" if target > 0 else "open_short"
-            self.last_price = self.price
         self.error = ""
         self.write_status()
 
@@ -252,9 +272,85 @@ def test_timeout_when_ea_never_acts():
         print("  ok: an EA that never acts times out instead of hanging")
 
 
+def test_close_is_booked_even_when_the_open_half_fails():
+    """A flip where the broker rejects the new leg still moved real money."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ea = FakeEA(os.path.join(tmp, "sig.csv"), os.path.join(tmp, "st.csv"))
+        b = _broker(tmp, ea)
+        b.wait_sec = 1.0
+        b.connect()
+        _drive(ea, lambda: b.market_order("XAUUSD", 1, 0.01))
+
+        ea.price = 3990.0          # the long is now 10 points under water
+        ea.fail_open = True        # close succeeds, the short is rejected
+
+        def flip():
+            try:
+                b.market_order("XAUUSD", -1, 0.01)
+                raise AssertionError("expected the rejected open to raise")
+            except BridgeError as exc:
+                assert "close WAS recorded" in str(exc), str(exc)
+
+        _drive(ea, flip)
+
+        closes = [f for f in b.fills if f.action == "close"]
+        assert len(closes) == 1, f"the executed close was lost ({len(closes)} booked)"
+        assert abs(closes[0].realized_pnl - (-10.0)) < 1e-6, closes[0].realized_pnl
+        assert b.get_position("XAUUSD").is_flat
+        print("  ok: a losing close is logged even when the open half is rejected")
+
+
+def test_signal_ids_continue_from_the_ea():
+    """A restart must not reuse ids the EA has already marked as handled."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ea = FakeEA(os.path.join(tmp, "sig.csv"), os.path.join(tmp, "st.csv"))
+        first = _broker(tmp, ea).connect()
+        _drive(ea, lambda: first.market_order("XAUUSD", 1, 0.01))
+        assert ea.last_id == 1, ea.last_id
+
+        restarted = _broker(tmp, ea).connect()          # fresh process, same EA
+        assert restarted._next_id == ea.last_id + 1, restarted._next_id
+
+        def go():
+            ea.price = 4020.0
+            return restarted.close_position("XAUUSD")
+
+        fill = _drive(ea, go)
+        assert fill is not None and fill.action == "close", fill
+        print("  ok: a restarted run continues the EA's id sequence")
+
+
+def test_unknown_close_profit_is_not_recorded_as_zero():
+    with tempfile.TemporaryDirectory() as tmp:
+        ea = FakeEA(os.path.join(tmp, "sig.csv"), os.path.join(tmp, "st.csv"))
+        b = _broker(tmp, ea).connect()
+        _drive(ea, lambda: b.market_order("XAUUSD", 1, 0.01))
+        ea.close_known = 0                      # EA could not read deal history
+        ea.price = 4050.0
+        _drive(ea, lambda: b.close_position("XAUUSD"))
+        pnl = [f for f in b.fills if f.action == "close"][-1].realized_pnl
+        assert pnl != 0.0 and pnl != pnl, f"unknown PnL booked as {pnl}"   # NaN
+        print("  ok: an unreadable close is NaN, never a fake break-even")
+
+
+def test_equity_holds_through_an_unreadable_poll():
+    with tempfile.TemporaryDirectory() as tmp:
+        ea = FakeEA(os.path.join(tmp, "sig.csv"), os.path.join(tmp, "st.csv"))
+        b = _broker(tmp, ea).connect()
+        assert b.account_equity() == 10_000.0
+        os.remove(ea.status_path)
+        held = b.account_equity()
+        assert held == 10_000.0, f"equity became {held} on one unreadable poll"
+        print("  ok: one unreadable poll holds equity instead of logging NaN")
+
+
 TESTS = [test_open_flip_and_close, test_target_is_idempotent, test_non_utc_server_clock,
          test_refuses_real_account_and_autotrading_off, test_missing_and_stale_status,
-         test_timeout_when_ea_never_acts]
+         test_timeout_when_ea_never_acts,
+         test_close_is_booked_even_when_the_open_half_fails,
+         test_signal_ids_continue_from_the_ea,
+         test_unknown_close_profit_is_not_recorded_as_zero,
+         test_equity_holds_through_an_unreadable_poll]
 
 if __name__ == "__main__":
     for t in TESTS:

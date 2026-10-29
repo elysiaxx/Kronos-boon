@@ -45,13 +45,21 @@ bool     g_blocked      = false;   // refusing to trade (e.g. real account)
 string   g_block_reason = "";
 string   g_last_error   = "";
 
-// last executed action, reported back to Python
+// Last executed action, reported back to Python. A flip is TWO legs in one
+// signal, so the close and the open each need their own slots - sharing one
+// price field made the close look like it exited at the open's price.
 string   g_last_action  = "none";
-double   g_last_price   = 0.0;
 datetime g_last_time    = 0;
-double   g_close_profit = 0.0;     // broker PnL of the last close, incl. swap/commission
+long     g_close_signal = -1;      // which signal produced the last close
+double   g_close_price  = 0.0;
+double   g_close_volume = 0.0;
+double   g_close_profit = 0.0;     // broker PnL of the whole position, all deals
+bool     g_close_known  = false;   // false => the deal lookup failed, do not trust it
 double   g_close_entry  = 0.0;
 datetime g_close_opened = 0;
+long     g_open_signal  = -1;      // which signal produced the last open
+double   g_open_price   = 0.0;
+double   g_open_volume  = 0.0;
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -149,20 +157,31 @@ double NormalizeVolume(double volume)
    return(NormalizeDouble(v, 2));
   }
 //+------------------------------------------------------------------+
-//| Realized PnL of a close, taken from the broker's own deal record  |
-//| so swap and commission are included.                              |
+//| Realized PnL of a finished position, summed over ALL of its deals |
+//| so the ENTRY's commission counts too, not just the exit's.        |
+//| ok=false means the lookup failed - the caller must not report 0.0 |
+//| as if it were a real break-even result.                           |
 //+------------------------------------------------------------------+
-double DealProfit(const ulong deal_ticket)
+double PositionRealizedProfit(const long position_id, bool &ok)
   {
-   if(deal_ticket == 0)
+   ok = false;
+   if(position_id == 0)
       return(0.0);
-   if(!HistorySelect(TimeCurrent() - 86400, TimeCurrent() + 60))
+   if(!HistorySelectByPosition(position_id))
       return(0.0);
-   if(!HistoryDealSelect(deal_ticket))
-      return(0.0);
-   return(HistoryDealGetDouble(deal_ticket, DEAL_PROFIT)
-        + HistoryDealGetDouble(deal_ticket, DEAL_SWAP)
-        + HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION));
+   double total = 0.0;
+   int deals = HistoryDealsTotal();
+   for(int i = 0; i < deals; i++)
+     {
+      ulong d = HistoryDealGetTicket(i);
+      if(d == 0)
+         continue;
+      total += HistoryDealGetDouble(d, DEAL_PROFIT)
+             + HistoryDealGetDouble(d, DEAL_SWAP)
+             + HistoryDealGetDouble(d, DEAL_COMMISSION);
+      ok = true;
+     }
+   return(ok ? total : 0.0);
   }
 //+------------------------------------------------------------------+
 //| Read the signal file. Returns false when there is nothing usable. |
@@ -257,17 +276,26 @@ void ProcessSignal()
    // Close whatever is open first, so a flip is always close-then-open.
    if(side != 0)
      {
+      long pos_id = 0;
+      if(PositionSelectByTicket(ticket))
+         pos_id = PositionGetInteger(POSITION_IDENTIFIER);  // must be read BEFORE closing
       g_close_entry  = pos_price;
       g_close_opened = opened;
       ok = g_trade.PositionClose(ticket, InpDeviation);
       if(ok)
         {
-         g_close_profit = DealProfit(g_trade.ResultDeal());
+         bool known = false;
+         g_close_profit = PositionRealizedProfit(pos_id, known);
+         g_close_known  = known;
+         g_close_signal = id;              // stamp it, so Python knows whose close this is
+         g_close_price  = g_trade.ResultPrice();
+         g_close_volume = pos_vol;
          g_last_action  = "close";
-         g_last_price   = g_trade.ResultPrice();
          g_last_time    = TimeCurrent();
-         PrintFormat("KronosTrader: closed %s %.2f @ %.5f  pnl=%.2f",
-                     side > 0 ? "long" : "short", pos_vol, g_last_price, g_close_profit);
+         PrintFormat("KronosTrader: closed %s %.2f @ %.5f  pnl=%s",
+                     side > 0 ? "long" : "short", pos_vol, g_close_price,
+                     known ? DoubleToString(g_close_profit, 2) : "UNKNOWN");
+         WriteStatus();                    // publish the close before attempting the open
         }
       else
         {
@@ -285,11 +313,13 @@ void ProcessSignal()
                         : g_trade.Sell(vol, _Symbol, 0.0, 0.0, 0.0, "kronos");
       if(ok)
         {
+         g_open_signal = id;
+         g_open_price  = g_trade.ResultPrice();
+         g_open_volume = vol;
          g_last_action = (target > 0) ? "open_long" : "open_short";
-         g_last_price  = g_trade.ResultPrice();
          g_last_time   = TimeCurrent();
          PrintFormat("KronosTrader: opened %s %.2f @ %.5f",
-                     target > 0 ? "long" : "short", vol, g_last_price);
+                     target > 0 ? "long" : "short", vol, g_open_price);
         }
       else
         {
@@ -348,11 +378,17 @@ void WriteStatus()
    FileWriteString(h, StringFormat("pos_profit=%.2f\n", pos_profit));
    FileWriteString(h, StringFormat("last_signal_id=%I64d\n", g_last_id));
    FileWriteString(h, StringFormat("last_action=%s\n", g_last_action));
-   FileWriteString(h, StringFormat("last_price=%.5f\n", g_last_price));
    FileWriteString(h, StringFormat("last_time=%I64d\n", (long)g_last_time));
+   FileWriteString(h, StringFormat("close_signal_id=%I64d\n", g_close_signal));
+   FileWriteString(h, StringFormat("close_price=%.5f\n", g_close_price));
+   FileWriteString(h, StringFormat("close_volume=%.2f\n", g_close_volume));
    FileWriteString(h, StringFormat("close_profit=%.2f\n", g_close_profit));
+   FileWriteString(h, StringFormat("close_profit_known=%d\n", g_close_known ? 1 : 0));
    FileWriteString(h, StringFormat("close_entry=%.5f\n", g_close_entry));
    FileWriteString(h, StringFormat("close_opened=%I64d\n", (long)g_close_opened));
+   FileWriteString(h, StringFormat("open_signal_id=%I64d\n", g_open_signal));
+   FileWriteString(h, StringFormat("open_price=%.5f\n", g_open_price));
+   FileWriteString(h, StringFormat("open_volume=%.2f\n", g_open_volume));
    FileWriteString(h, StringFormat("error=%s\n", err));
    FileClose(h);
 

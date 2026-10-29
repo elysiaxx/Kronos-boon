@@ -131,7 +131,12 @@ def compute_stats(data: dict) -> dict:
     equity = [d["equity"] for d in decisions if d["equity"] is not None]
     final = float(session.get("final_equity") or (equity[-1] if equity else initial))
 
-    pnls = [t["pnl"] for t in trades if t["pnl"] is not None]
+    # A close the broker could not price (the EA failed to read deal history)
+    # is recorded as NaN, never as 0. Count those separately rather than let
+    # one of them turn every downstream statistic into NaN.
+    booked = [t["pnl"] for t in trades if t["pnl"] is not None]
+    pnls = [p for p in booked if math.isfinite(p)]
+    unknown_pnl = len(booked) - len(pnls)
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
     gross_win, gross_loss = sum(wins), -sum(losses)
@@ -158,6 +163,7 @@ def compute_stats(data: dict) -> dict:
         "return_pct": ((final - initial) / initial * 100.0) if initial else float("nan"),
         "n_decisions": len(decisions),
         "n_trades": len(pnls),
+        "trades_unknown_pnl": unknown_pnl,
         "wins": len(wins),
         "losses": len(losses),
         "hit_rate": (len(wins) / len(pnls)) if pnls else float("nan"),
@@ -341,7 +347,8 @@ _PAGE_JS = r"""
         note: `Vốn ${fmt(S.initial_cash, 0)} → ${fmt(S.final_equity, 2)} (${signed(S.return_pct, 2)}%).` },
       { label: "Số lệnh & tỷ lệ thắng", en: "trades / hit rate",
         value: `${S.n_trades} · ${pct(S.hit_rate, 0)}`,
-        note: `${S.wins} thắng, ${S.losses} thua. Trung bình thắng ${fmt(S.avg_win, 2)}, thua ${fmt(S.avg_loss, 2)}.` },
+        note: `${S.wins} thắng, ${S.losses} thua. Trung bình thắng ${fmt(S.avg_win, 2)}, thua ${fmt(S.avg_loss, 2)}.`
+              + (S.trades_unknown_pnl ? ` ${S.trades_unknown_pnl} lệnh không đọc được lãi lỗ, đã loại khỏi thống kê.` : "") },
       { label: "Sụt vốn sâu nhất", en: "max drawdown",
         value: fmt(S.max_drawdown, 2), cls: "down",
         note: `${fmt(S.max_drawdown_pct, 1)}% so với đỉnh vốn. Đây là mức đau nhất trong phiên.` },
