@@ -384,6 +384,82 @@ window.Viz = (function () {
     return f;
   }
 
+  /* Candles with the trades drawn on top - the view an MT5 chart would give.
+     bars: [{t, o, h, l, c}]  trades: [{entryIdx, exitIdx, side, pnl}]
+     opts: {height, padRight, yLabel, yDec, xTicks:[{v,text}], tooltip(i)} */
+  function candleChart(hostId, bars, trades, opts) {
+    opts = opts || {};
+    const host = document.getElementById(hostId);
+    if (!host || !bars.length) return;
+    const f = frame(host, opts.height || 340, { l: 58, r: opts.padRight || 14, t: 20, b: 34 });
+    const lows = bars.map(b => b.l), highs = bars.map(b => b.h);
+    let lo = Math.min(...lows), hi = Math.max(...highs);
+    const padv = (hi - lo || 1) * 0.06; lo -= padv; hi += padv;
+    const n = bars.length;
+    const X = (i) => f.pad.l + (n <= 1 ? f.iw / 2 : (i + 0.5) / n * f.iw);
+    const Y = yAxis(f, lo, hi, opts.yLabel, opts.yDec);
+    baseline(f, f.pad.t + f.ih);
+
+    // Holding periods first, so candles and markers sit on top of the wash.
+    for (const t of trades) {
+      if (t.entryIdx == null || t.exitIdx == null) continue;
+      const x0 = X(t.entryIdx), x1 = X(t.exitIdx);
+      mk("rect", { x: Math.min(x0, x1), y: f.pad.t, width: Math.max(2, Math.abs(x1 - x0)),
+                   height: f.ih, fill: t.pnl >= 0 ? css("--good") : css("--critical"),
+                   opacity: 0.10 }, f.svg);
+    }
+
+    const slot = f.iw / n;
+    const bw = Math.max(1, Math.min(9, slot - 2));   // >= 2px gap between candles
+    bars.forEach((b, i) => {
+      const x = X(i), up = b.c >= b.o;
+      const colour = up ? css("--good-ink") : css("--critical");
+      mk("line", { x1: x, x2: x, y1: Y(b.h), y2: Y(b.l), stroke: colour, "stroke-width": 1 }, f.svg);
+      const top = Y(Math.max(b.o, b.c)), bot = Y(Math.min(b.o, b.c));
+      mk("rect", { x: x - bw / 2, y: top, width: bw, height: Math.max(1, bot - top),
+                   fill: colour }, f.svg);
+    });
+
+    // Entry and exit markers: glyph carries the meaning, colour only repeats it.
+    for (const t of trades) {
+      if (t.entryIdx == null) continue;
+      const long = t.side > 0;
+      const x = X(t.entryIdx), y = Y(long ? bars[t.entryIdx].l : bars[t.entryIdx].h);
+      const dy = long ? 12 : -12;
+      const tri = long ? `${x},${y + 4} ${x - 5},${y + 13} ${x + 5},${y + 13}`
+                       : `${x},${y - 4} ${x - 5},${y - 13} ${x + 5},${y - 13}`;
+      mk("polygon", { points: tri, fill: long ? css("--good") : css("--critical"),
+                      stroke: css("--surface"), "stroke-width": 2 }, f.svg);
+      if (t.exitIdx != null && bars[t.exitIdx]) {
+        mk("circle", { cx: X(t.exitIdx), cy: Y(bars[t.exitIdx].c), r: 4.5, fill: "none",
+                       stroke: t.pnl >= 0 ? css("--good") : css("--critical"),
+                       "stroke-width": 2 }, f.svg);
+      }
+    }
+
+    if (opts.xTicks) xLabels(f, opts.xTicks.map(t => ({ x: X(t.v), text: t.text })));
+    xTitle(f, opts.xTitle);
+
+    if (opts.tooltip) {
+      const cross = mk("line", { y1: f.pad.t, y2: f.pad.t + f.ih, stroke: css("--axis"),
+                                 "stroke-width": 1, opacity: 0 }, f.svg);
+      const hit = mk("rect", { x: f.pad.l, y: f.pad.t, width: f.iw, height: f.ih,
+                               fill: "transparent" }, f.svg);
+      hit.addEventListener("mousemove", (e) => {
+        const bb = f.svg.getBoundingClientRect();
+        const px = (e.clientX - bb.left) / bb.width * f.w;
+        let i = Math.floor((px - f.pad.l) / f.iw * n);
+        i = Math.max(0, Math.min(n - 1, i));
+        cross.setAttribute("x1", X(i)); cross.setAttribute("x2", X(i));
+        cross.setAttribute("opacity", 1);
+        const html = opts.tooltip(i);
+        if (html) showTip(e, html); else hideTip();
+      });
+      hit.addEventListener("mouseleave", () => { cross.setAttribute("opacity", 0); hideTip(); });
+    }
+    return f;
+  }
+
   /* Evenly spaced tick positions over an index range, always including the last. */
   function indexTicks(n, want) {
     const step = Math.max(1, Math.round((n - 1) / (want || 5)));
@@ -399,7 +475,8 @@ window.Viz = (function () {
   }
 
   return { css, fmt, pct, signed, shortTs, mk, showTip, hideTip, ticks, frame, yAxis,
-           xLabels, xTitle, baseline, endLabel, barChart, lineChart, indexTicks, onResize };
+           xLabels, xTitle, baseline, endLabel, barChart, lineChart, candleChart,
+           indexTicks, onResize };
 })();
 """
 

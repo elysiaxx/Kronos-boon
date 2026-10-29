@@ -60,6 +60,7 @@ def load_session(session_json: str) -> dict:
     decisions = [{
         "time": r.get("bar_time", ""),
         "anchor": _f(r, "anchor"),
+        "open": _f(r, "open"), "high": _f(r, "high"), "low": _f(r, "low"),
         "target": _f(r, "target"),
         "exp_move_pct": _f(r, "exp_move_pct"),
         "direction": int(_f(r, "direction", 0) or 0),
@@ -311,7 +312,21 @@ __SPREAD_WARN__
   <p class="caveat" id="ddNote"></p>
 </div>
 
-<h2><span class="num">2.</span>Từng lệnh lãi hay lỗ</h2>
+<h2><span class="num">2.</span>Biểu đồ giá và các lệnh</h2>
+<p class="sub">Đúng thứ bạn sẽ thấy trên chart MT5: nến giá, kèm điểm vào và ra của từng lệnh. Vùng tô là khoảng thời gian đang giữ vị thế.</p>
+<div class="card">
+  <div class="legend">
+    <span class="k"><span class="sw" style="background:var(--good)"></span>▲ Vào lệnh MUA</span>
+    <span class="k"><span class="sw" style="background:var(--critical)"></span>▼ Vào lệnh BÁN</span>
+    <span class="k"><span class="sw" style="background:var(--text-muted)"></span>◯ Đóng lệnh</span>
+    <span class="k">Vùng tô xanh = lệnh lãi, đỏ = lệnh lỗ</span>
+  </div>
+  <div class="controls" id="candleControls"></div>
+  <div class="chart" id="candleChart"></div>
+  <p class="caveat" id="candleNote"></p>
+</div>
+
+<h2><span class="num">3.</span>Từng lệnh lãi hay lỗ</h2>
 <p class="sub">Mỗi cột là một lệnh đã đóng. Cột xanh lá là lệnh lãi, cột đỏ là lệnh lỗ.</p>
 <div class="card">
   <div class="legend">
@@ -322,19 +337,19 @@ __SPREAD_WARN__
   <p class="caveat">Một chuỗi lệnh lỗ liên tiếp là bình thường ngay cả với chiến lược tốt. Điều cần nhìn là tổng thể và mức sụt vốn, không phải một cột lẻ.</p>
 </div>
 
-<h2><span class="num">3.</span>Bảng từng lệnh</h2>
+<h2><span class="num">4.</span>Bảng từng lệnh</h2>
 <div class="card" style="padding:0; overflow:hidden">
   <div class="scroll" style="border:0"><table id="tradeTable"></table></div>
 </div>
 
-<h2><span class="num">4.</span>Nhật ký quyết định theo từng nến</h2>
+<h2><span class="num">5.</span>Nhật ký quyết định theo từng nến</h2>
 <p class="sub">Mô hình nghĩ gì ở mỗi nến, kể cả những nến nó chọn đứng ngoài.</p>
 <details>
   <summary>Mở nhật ký (__N_DECISIONS__ dòng)</summary>
   <div class="scroll" style="margin-top:10px"><table id="decisionTable"></table></div>
 </details>
 
-<h2><span class="num">5.</span>Đọc kết quả này thế nào</h2>
+<h2><span class="num">6.</span>Đọc kết quả này thế nào</h2>
 <div class="card">
   <dl class="gloss">
     <dt>Net P&amp;L / Return</dt>
@@ -357,7 +372,7 @@ __SPREAD_WARN__
 _PAGE_JS = r"""
 (function () {
   "use strict";
-  const { fmt, signed, pct, shortTs, css, barChart, lineChart, onResize } = Viz;
+  const { fmt, signed, pct, shortTs, css, barChart, lineChart, candleChart, onResize } = Viz;
   const D = JSON.parse(document.getElementById("payload").textContent);
   const S = D.stats, SES = D.session, TR = D.trades, DEC = D.decisions;
   const CUR = SES.currency || "";
@@ -489,7 +504,58 @@ _PAGE_JS = r"""
       + "</tbody>";
   }
 
-  const renderAll = () => { drawEquity(); drawTrades(); };
+  function drawCandles() {
+    const host = document.getElementById("candleChart");
+    const note = document.getElementById("candleNote");
+    const withOhlc = DEC.filter(d => d.open !== null && d.high !== null && d.low !== null);
+    if (withOhlc.length < 2) {
+      host.innerHTML = '<p class="caveat">Phiên này chưa ghi OHLC từng nến nên không vẽ được '
+                     + 'biểu đồ nến. Các phiên chạy từ bây giờ sẽ có.</p>';
+      note.textContent = "";
+      return;
+    }
+    // A long run has more bars than pixels; show the most recent slice.
+    const MAX = 240;
+    const shown = withOhlc.slice(-MAX);
+    const offset = withOhlc.length - shown.length;
+    const bars = shown.map(d => ({ t: d.time, o: d.open, h: d.high, l: d.low, c: d.anchor }));
+    const idx = new Map(shown.map((d, i) => [String(d.time), i]));
+
+    const marks = TR.map(t => ({
+      side: t.side, pnl: t.pnl,
+      entryIdx: idx.has(String(t.entry_time)) ? idx.get(String(t.entry_time)) : null,
+      exitIdx: idx.has(String(t.exit_time)) ? idx.get(String(t.exit_time)) : null,
+    })).filter(m => m.entryIdx !== null || m.exitIdx !== null);
+
+    const every = Math.max(1, Math.round(bars.length / 6));
+    const xTicks = [];
+    for (let k = 0; k < bars.length; k += every) xTicks.push({ v: k, text: shortTs(bars[k].t) });
+
+    const byEntry = new Map(), byExit = new Map();
+    for (const m of marks) {
+      if (m.entryIdx !== null) byEntry.set(m.entryIdx, m);
+      if (m.exitIdx !== null) byExit.set(m.exitIdx, m);
+    }
+    candleChart("candleChart", bars, marks, {
+      height: 340, padRight: 20, yLabel: "giá", yDec: 0, xTitle: "thời gian",
+      xTicks,
+      tooltip: (i) => {
+        const b = bars[i];
+        let html = `<b>${shortTs(b.t)}</b><br>mở ${fmt(b.o, 2)} · cao ${fmt(b.h, 2)}`
+                 + `<br>thấp ${fmt(b.l, 2)} · đóng ${fmt(b.c, 2)}`;
+        const e = byEntry.get(i);
+        if (e) html += `<br><b>${e.side > 0 ? "▲ VÀO MUA" : "▼ VÀO BÁN"}</b>`;
+        const x = byExit.get(i);
+        if (x) html += `<br><b>◯ ĐÓNG ${signed(x.pnl, 2)}</b>`;
+        return html;
+      },
+    });
+    note.textContent = offset > 0
+      ? `Hiển thị ${bars.length} nến gần nhất trong tổng ${withOhlc.length} nến của phiên.`
+      : `${bars.length} nến, toàn bộ phiên.`;
+  }
+
+  const renderAll = () => { drawEquity(); drawCandles(); drawTrades(); };
   tiles(); drawTradeTable(); drawDecisions(); renderAll();
   onResize(renderAll);
 })();

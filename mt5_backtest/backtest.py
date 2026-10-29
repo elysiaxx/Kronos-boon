@@ -40,6 +40,7 @@ _REPO_ROOT = os.path.dirname(_THIS_DIR)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from mt5_backtest import line_buffer_stdout  # noqa: E402
 from mt5_backtest.data_source import (  # noqa: E402
     CSVDataSource,
     MT5DataSource,
@@ -323,6 +324,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None):
+    line_buffer_stdout()
     args = build_arg_parser().parse_args(argv)
     if args.lookback > (args.max_context or _MODEL_DEFAULTS.get(args.model, (None, 512))[1]):
         print(f"[warn] lookback {args.lookback} exceeds model context; it will be truncated by the predictor.")

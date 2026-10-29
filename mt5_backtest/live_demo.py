@@ -79,6 +79,7 @@ _REPO_ROOT = os.path.dirname(_THIS_DIR)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from mt5_backtest import line_buffer_stdout  # noqa: E402
 from mt5_backtest.data_source import CSVDataSource, timeframe_minutes  # noqa: E402
 from mt5_backtest.live_feed import build_feed, wait_for_new_bar  # noqa: E402
 from mt5_backtest.strategy import SignalGenerator  # noqa: E402
@@ -94,14 +95,23 @@ class TradeLogger:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self._fh = open(path, "w", newline="", encoding="utf-8")
         self._w = csv.writer(self._fh)
+        # open/high/low of the decision bar as well as its close (anchor), so a
+        # report can draw the actual candles the decisions were made on.
         self._w.writerow(["bar_time", "anchor", "target", "exp_move_pct",
-                           "direction", "action", "fill_price", "equity"])
+                          "direction", "action", "fill_price", "equity",
+                          "open", "high", "low"])
 
-    def log(self, bar_time, sig, action, fill_price, equity):
-        self._w.writerow([bar_time, f"{sig.anchor:.5f}", f"{sig.target:.5f}",
-                          f"{sig.expected_move_pct:.4f}", sig.direction, action,
-                          "" if fill_price is None else f"{fill_price:.5f}",
-                          f"{equity:.2f}"])
+    def log(self, bar_time, sig, action, fill_price, equity, bar=None):
+        row = [bar_time, f"{sig.anchor:.5f}", f"{sig.target:.5f}",
+               f"{sig.expected_move_pct:.4f}", sig.direction, action,
+               "" if fill_price is None else f"{fill_price:.5f}",
+               f"{equity:.2f}"]
+        if bar is None:
+            row += ["", "", ""]
+        else:
+            row += [f"{float(bar['open']):.5f}", f"{float(bar['high']):.5f}",
+                    f"{float(bar['low']):.5f}"]
+        self._w.writerow(row)
         self._fh.flush()
 
     def close(self):
@@ -194,7 +204,7 @@ def run_replay(args, predictor, broker, logger, fills_log):
         action, fill_price = _act_on_signal(broker, args.symbol, sig, exec_price, next_bar["timestamps"])
         broker.mark(float(next_bar["close"]))
         equity = broker.account_equity()
-        logger.log(next_bar["timestamps"], sig, action, fill_price, equity)
+        logger.log(next_bar["timestamps"], sig, action, fill_price, equity, bar=next_bar)
         fills_log.sync(broker)
         last_bar = next_bar
 
@@ -283,7 +293,7 @@ def _decide_and_act(args, broker, logger, fills_log, bars, bar_time, period, pap
         # Whatever happened, record what the broker did manage to execute.
         fills_log.sync(broker)
     equity = broker.account_equity()
-    logger.log(bar_time, sig, action, fill_price, equity)
+    logger.log(bar_time, sig, action, fill_price, equity, bar=hist.iloc[-1])
     fills_log.sync(broker)
     print(f"[live] {bar_time}  close={last_close:.2f}  dir={sig.direction:+d} "
           f"move={sig.expected_move_pct:+.3f}%  {action:12s} equity={equity:.2f}", flush=True)
@@ -401,13 +411,7 @@ def main(argv=None):
     global siggen
     args = build_arg_parser().parse_args(argv)
 
-    # A forward test is normally watched through `| tee run.log`, and a pipe
-    # makes stdout block-buffered - the loop would appear to print nothing for
-    # hours. Line buffering costs nothing here and keeps the log live.
-    try:
-        sys.stdout.reconfigure(line_buffering=True)
-    except AttributeError:  # pragma: no cover - very old Python
-        pass
+    line_buffer_stdout()
 
     if args.broker == "mt5" and args.feed != "mt5":
         raise SystemExit(
