@@ -85,10 +85,27 @@ close, tick_volume, real_volume, spread` đều được tự nhận diện).
 
 Script in ra bảng tóm tắt và lưu vào `mt5_backtest/results/`:
 
-* `<symbol>_<tf>_<time>_report.json` — toàn bộ số liệu.
+* **`..._report.html` — mở file này trước.** Báo cáo tương tác, tự giải thích:
+  xem được **từng** cửa sổ dự báo vẽ đè lên giá thật (kéo thanh trượt, hoặc bấm
+  "lần tệ nhất / tốt nhất"), độ chính xác theo từng mốc, đường vốn, bảng chi
+  tiết 1 dòng = 1 lần dự báo, và một mục giải nghĩa mọi chỉ số. File đứng độc
+  lập (không cần mạng, không cần thư viện) — bấm đúp là xem được bằng trình
+  duyệt.
+* `..._report.json` — toàn bộ số liệu, để xử lý tiếp bằng script.
+* `..._detail.json` — số liệu + dữ liệu từng cửa sổ. Dựng lại trang HTML từ file
+  này mà **không cần chạy lại mô hình**:
+
+  ```bash
+  python -m mt5_backtest.report_html mt5_backtest/results/XAUUSD_M15_..._detail.json
+  ```
+
 * `..._sample_window.png` — một cửa sổ mẫu: lịch sử + thực tế + dự báo.
 * `..._dir_accuracy.png` — độ chính xác hướng theo từng mốc dự báo.
 * `..._equity_curve.png` — đường vốn của chiến lược "theo hướng" đơn giản.
+
+Tắt bớt đầu ra nếu không cần: `--no_html` (bỏ trang HTML), `--no_plots` (bỏ
+PNG). `--hist_tail N` chỉnh số nến quá khứ vẽ kèm mỗi cửa sổ trong trang HTML
+(mặc định 80, chỉ ảnh hưởng hiển thị).
 
 Các chỉ số:
 
@@ -96,6 +113,10 @@ Các chỉ số:
 * **Directional accuracy** — tỉ lệ mô hình đoán đúng **hướng** (lên/xuống) so
   với giá đóng cửa cuối cùng quan sát được. **50% = tung đồng xu**; cao hơn
   đáng kể và ổn định mới có giá trị.
+* **Khoảng tin cậy 95% + p-value** — in kèm ngay dưới directional accuracy. Với
+  vài chục cửa sổ, 58% và 50% gần như không phân biệt được: nếu `p > 0.05` thì
+  kết quả **chưa** loại được khả năng chỉ do may mắn. Muốn kết luận chắc hơn thì
+  tăng `--n_windows` (hoặc chạy trên nhiều đoạn dữ liệu khác nhau).
 * **Naive strategy** — long/short thuần theo hướng dự báo tại `eval_horizon`,
   quy ra % lợi nhuận để biết dự báo có *dùng được* không. Đây **không phải
   khuyến nghị đầu tư**, chỉ là một thước đo.

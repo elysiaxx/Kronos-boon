@@ -24,6 +24,7 @@ Two families of metrics are produced:
 
 from __future__ import annotations
 
+import math
 from typing import List
 
 import numpy as np
@@ -63,6 +64,39 @@ def directional_accuracy(anchor: np.ndarray, actual_close: np.ndarray, pred_clos
     if a_dir.size == 0:
         return float("nan")
     return float(np.mean(a_dir == p_dir))
+
+
+def directional_hits(anchor: np.ndarray, actual_close: np.ndarray, pred_close: np.ndarray) -> tuple[int, int]:
+    """(hits, n) for the directional comparison, so a confidence interval can be built."""
+    anchor = np.asarray(anchor, dtype=float)
+    a_dir = np.sign(np.asarray(actual_close, dtype=float) - anchor)
+    p_dir = np.sign(np.asarray(pred_close, dtype=float) - anchor)
+    return int(np.sum(a_dir == p_dir)), int(a_dir.size)
+
+
+def wilson_interval(hits: int, n: int, z: float = 1.959964) -> tuple[float, float]:
+    """Wilson score interval for a proportion (better than normal approx at small n)."""
+    if n <= 0:
+        return (float("nan"), float("nan"))
+    p = hits / n
+    denom = 1.0 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def binomial_p_value(hits: int, n: int, p0: float = 0.5) -> float:
+    """Exact two-sided binomial test: how likely is a result this lopsided by luck?"""
+    if n <= 0:
+        return float("nan")
+
+    def pmf(k: int) -> float:
+        return math.comb(n, k) * (p0 ** k) * ((1 - p0) ** (n - k))
+
+    observed = pmf(hits)
+    # Sum every outcome at least as unlikely as the observed one (with a tiny
+    # tolerance so symmetric outcomes are not dropped to floating-point noise).
+    return float(min(1.0, sum(pmf(k) for k in range(n + 1) if pmf(k) <= observed * (1 + 1e-9))))
 
 
 def naive_strategy(
@@ -144,6 +178,15 @@ def aggregate(
         per_horizon.append(pe)
 
     headline_dir = directional_accuracy(anchors, actuals[:, hi], preds[:, hi])
+    hits, n_dir = directional_hits(anchors, actuals[:, hi], preds[:, hi])
+    ci_lo, ci_hi = wilson_interval(hits, n_dir)
+    dir_stats = {
+        "hits": hits,
+        "n": n_dir,
+        "ci95_low": ci_lo,
+        "ci95_high": ci_hi,
+        "p_value_vs_coinflip": binomial_p_value(hits, n_dir),
+    }
     strat = naive_strategy(anchors, actuals[:, hi], preds[:, hi], cost_pct=cost_pct)
 
     return {
@@ -152,6 +195,7 @@ def aggregate(
         "eval_horizon": int(h),
         "point_errors_overall": overall,
         "directional_accuracy_at_eval_horizon": headline_dir,
+        "directional_stats": dir_stats,
         "per_horizon": per_horizon,
         "naive_strategy": strat,
     }
@@ -175,6 +219,16 @@ def format_report(summary: dict, symbol: str, timeframe: str) -> str:
         "-" * 64,
         f" Directional accuracy @ bar {summary['eval_horizon']} : "
         f"{summary['directional_accuracy_at_eval_horizon'] * 100:.2f} %   (50% = coin flip)",
+    ]
+    ds = summary.get("directional_stats")
+    if ds and ds.get("n"):
+        lines += [
+            f"   correct       : {ds['hits']} / {ds['n']} windows",
+            f"   95% CI        : {ds['ci95_low'] * 100:.1f} % .. {ds['ci95_high'] * 100:.1f} %",
+            f"   p vs 50/50    : {ds['p_value_vs_coinflip']:.3f}"
+            f"   {'(significant)' if ds['p_value_vs_coinflip'] < 0.05 else '(NOT significant - could be luck)'}",
+        ]
+    lines += [
         "-" * 64,
         " Naive direction-only strategy (NOT investment advice):",
         f"   trades        : {strat['n_trades']}",

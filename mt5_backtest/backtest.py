@@ -10,7 +10,9 @@ What it does
    future bars that MT5 already knows.
 3. Compare predicted vs. realized closes and report point-accuracy,
    directional accuracy, and a naive direction-only strategy. Save a JSON
-   report plus charts.
+   report, PNG charts, and an interactive HTML report that draws every
+   forecast window against what actually happened (open it in a browser -
+   it is the readable version of the numbers printed to the terminal).
 
 This measures how well the pre-trained model forecasts the chosen instrument;
 no look-ahead is possible because each forecast only ever sees bars strictly
@@ -130,6 +132,7 @@ def run_backtest(args) -> dict:
         torch.manual_seed(args.seed)
 
     anchors, actuals, preds = [], [], []
+    windows = []            # per-window detail for the interactive HTML report
     sample_window = None
     sample_pick = len(starts) // 2  # a middle window for the overlay chart
 
@@ -159,6 +162,19 @@ def run_backtest(args) -> dict:
         actuals.append(fut["close"].to_numpy(dtype=float))
         preds.append(pred_df["close"].to_numpy(dtype=float))
 
+        tail = max(1, args.hist_tail)
+        windows.append({
+            "index": wi,
+            "start": int(s),
+            "anchor": anchor,
+            "anchor_ts": str(x_ts.iloc[-1]),
+            "hist_ts": [str(t) for t in x_ts.iloc[-tail:]],
+            "hist_close": [float(v) for v in hist["close"].to_numpy()[-tail:]],
+            "fut_ts": [str(t) for t in y_ts],
+            "fut_close": [float(v) for v in fut["close"].to_numpy()],
+            "pred_close": [float(v) for v in pred_df["close"].to_numpy()],
+        })
+
         if wi == sample_pick:
             sample_window = {
                 "hist_ts": x_ts, "hist_close": hist["close"].to_numpy(dtype=float),
@@ -186,11 +202,11 @@ def run_backtest(args) -> dict:
     print()
     print(metrics.format_report(summary, args.symbol, args.timeframe))
 
-    _save_outputs(args, summary, sample_window)
+    _save_outputs(args, summary, sample_window, windows)
     return summary
 
 
-def _save_outputs(args, summary, sample_window):
+def _save_outputs(args, summary, sample_window, windows=None):
     out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -200,6 +216,18 @@ def _save_outputs(args, summary, sample_window):
     with open(json_path, "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, default=float)
     print(f"\n[out] report : {json_path}")
+
+    if windows and not args.no_html:
+        from mt5_backtest.report_html import build_detail, write_report
+
+        detail = build_detail(summary, windows, args.symbol, args.timeframe)
+        detail_path = os.path.join(out_dir, f"{tag}_detail.json")
+        with open(detail_path, "w", encoding="utf-8") as fh:
+            json.dump(detail, fh, default=float)
+        html_path = write_report(detail, os.path.join(out_dir, f"{tag}_report.html"))
+        print(f"[out] detail : {detail_path}")
+        print(f"[out] HTML   : {html_path}")
+        print(f"[out]          ^ open this one - every window drawn + each metric explained")
 
     if args.no_plots:
         return
@@ -287,7 +315,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--mt5_path", default=None, help="path to terminal64.exe (optional)")
     # output
     p.add_argument("--out_dir", default=os.path.join(_THIS_DIR, "results"))
-    p.add_argument("--no_plots", action="store_true")
+    p.add_argument("--no_plots", action="store_true", help="skip the PNG charts")
+    p.add_argument("--no_html", action="store_true", help="skip the interactive HTML report")
+    p.add_argument("--hist_tail", type=int, default=80,
+                   help="history bars kept per window in the HTML report (display only)")
     return p
 
 
