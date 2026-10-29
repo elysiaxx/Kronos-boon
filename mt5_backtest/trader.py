@@ -1,14 +1,20 @@
 """
 Broker abstractions for the Kronos forward-test / demo trading loop.
 
-Two interchangeable brokers share one interface so the live loop code is
+Three interchangeable brokers share one interface so the live loop code is
 identical whether it is paper-trading or sending real orders to a demo
 account:
 
-* ``PaperBroker`` - fully in-memory simulation. No MT5 needed, works on any
-  OS. Used for dry-runs / CSV replay and for validating the loop logic.
-* ``MT5Broker``   - sends market orders to a running MetaTrader 5 terminal
-  via ``order_send`` (Windows only).
+* ``PaperBroker``      - fully in-memory simulation. No MT5 needed, works on
+  any OS. Used for dry-runs / CSV replay and for validating the loop logic.
+* ``MT5Broker``        - sends market orders to a running MetaTrader 5
+  terminal via ``order_send``. Needs the ``MetaTrader5`` package, which ships
+  for Windows only.
+* ``FileSignalBroker`` - writes the wanted position to a file that the
+  ``KronosTrader.mq5`` expert advisor reads and executes, then reads the
+  account and fill details back from the EA's status file. The terminal does
+  the trading, so this places **real orders from macOS**, where the Python
+  package does not exist.
 
 Only a single net position per symbol is supported (flat / long / short),
 which keeps the forward test easy to reason about.
@@ -20,7 +26,10 @@ matching the intended use of this tool.
 
 from __future__ import annotations
 
+import os
+import time as _time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 
 
@@ -287,3 +296,207 @@ class MT5Broker:
         if self._mt5 is not None:
             self._mt5.shutdown()
             self._mt5 = None
+
+
+class BridgeError(RuntimeError):
+    """The EA side of the file bridge is missing, stale, or refusing to trade."""
+
+
+class FileSignalBroker:
+    """Place real orders through ``KronosTrader.mq5`` via two files.
+
+    Python writes the **target net position** (+1 long, -1 short, 0 flat) to
+    the signal file; the EA moves the account to that target and publishes the
+    account, position and last fill to the status file. Targets rather than
+    orders means a signal that is read twice, or re-read after a restart, can
+    never double up a position.
+
+    Both files live in the terminal's ``Common\\Files`` sandbox, which native
+    macOS Python can read and write even though MT5 itself runs under Wine.
+
+    Safety: ``connect()`` refuses a REAL account unless ``allow_real=True``
+    (the EA refuses independently, so both sides have to be overridden), and
+    refuses to start at all if the EA is not running or AutoTrading is off.
+    """
+
+    #: how fresh the EA's status file has to be, in seconds
+    STALE_AFTER = 120.0
+
+    def __init__(self, signal_path: str, status_path: str, symbol: str,
+                 contract_size: float = 1.0, wait_sec: float = 20.0,
+                 poll_sec: float = 0.5, allow_real: bool = False):
+        self.signal_path = signal_path
+        self.status_path = status_path
+        self.symbol = symbol
+        self.contract_size = float(contract_size)
+        self.wait_sec = float(wait_sec)
+        self.poll_sec = float(poll_sec)
+        self.allow_real = allow_real
+        self.fills: list[Fill] = []
+        self.initial_equity: Optional[float] = None
+        self._next_id = 1
+        # Server clock minus ours. MT5 server time is usually not UTC, and the
+        # EA ages signals against TimeCurrent(), so stamps have to be sent in
+        # the server's time base or every signal looks stale on arrival.
+        self._server_offset = 0.0
+
+    # --- status file -----------------------------------------------------
+    def _read_status(self, require_fresh: bool = True) -> dict:
+        if not os.path.exists(self.status_path):
+            raise BridgeError(
+                f"no status file at {self.status_path}\n"
+                "Attach KronosTrader.mq5 to a chart of this symbol and make sure "
+                "InpStatusFile / InpUseCommon match the paths passed here."
+            )
+        age = _time.time() - os.path.getmtime(self.status_path)
+        if require_fresh and age > self.STALE_AFTER:
+            raise BridgeError(
+                f"status file is {age:.0f}s old - KronosTrader.mq5 looks stopped. "
+                "Check the EA is still on the chart and the terminal is running."
+            )
+        # The EA writes to a temp file and moves it into place, so a read here
+        # is either the previous file or the new one, never a torn one.
+        out = {}
+        with open(self.status_path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if "=" in line:
+                    key, _, value = line.partition("=")
+                    out[key.strip()] = value.strip()
+        server_now = self._num(out, "time")
+        if server_now > 0:
+            self._server_offset = server_now - _time.time()
+        return out
+
+    @staticmethod
+    def _num(status: dict, key: str, default: float = 0.0) -> float:
+        try:
+            return float(status.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _server_time(status: dict, key: str):
+        """Read an epoch field the EA wrote. These are MT5 *server* times, the
+        same base as the bar timestamps, so they are not converted."""
+        try:
+            epoch = int(float(status.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            return None
+        return datetime.utcfromtimestamp(epoch) if epoch > 0 else None
+
+    # --- interface -------------------------------------------------------
+    def connect(self):
+        status = self._read_status()
+        if status.get("blocked") == "1":
+            raise BridgeError(f"KronosTrader.mq5 is refusing to trade: {status.get('error', '')}")
+        mode = (status.get("trade_mode") or "UNKNOWN").upper()
+        if mode == "REAL" and not self.allow_real:
+            raise PermissionError(
+                f"Refusing to trade on a REAL account (login={status.get('account')}, "
+                f"server={status.get('server')}). This tool is meant for demo accounts. "
+                "Pass --allow_real only if you truly intend to trade real money."
+            )
+        if status.get("autotrading") != "1":
+            raise BridgeError(
+                "AutoTrading is off in the terminal, so the EA cannot place orders. "
+                "Turn on the AutoTrading toolbar button and allow algo trading for the EA."
+            )
+        if status.get("symbol") and status["symbol"] != self.symbol:
+            raise BridgeError(
+                f"the EA is on {status['symbol']} but this run trades {self.symbol}; "
+                "attach KronosTrader.mq5 to the right chart."
+            )
+        self.initial_equity = self._num(status, "equity")
+        print(f"[bridge] EA connected: account={status.get('account')} "
+              f"server={status.get('server')} mode={mode} "
+              f"equity={self.initial_equity:.2f} {status.get('currency', '')}")
+        return self
+
+    def account_equity(self) -> float:
+        try:
+            return self._num(self._read_status(), "equity")
+        except BridgeError:
+            # Do not kill a multi-day run over one unreadable poll.
+            return float("nan")
+
+    def get_position(self, symbol: str) -> Position:
+        status = self._read_status()
+        side = int(self._num(status, "pos_side"))
+        if side == 0:
+            return Position()
+        return Position(side=side, volume=self._num(status, "pos_volume"),
+                        entry_price=self._num(status, "pos_price"),
+                        entry_time=self._server_time(status, "pos_time"))
+
+    def mark(self, price):
+        pass  # the terminal marks to market itself
+
+    def market_order(self, symbol: str, side: int, volume: float, price=None, time=None) -> Fill:
+        if side not in (1, -1):
+            raise ValueError("side must be +1 (long) or -1 (short)")
+        return self._goto(side, volume, time) or Fill(time, symbol, "hold", 0.0, 0.0)
+
+    def close_position(self, symbol: str, price=None, time=None) -> Optional[Fill]:
+        return self._goto(0, 0.0, time)
+
+    def shutdown(self):
+        pass
+
+    # --- the handshake ---------------------------------------------------
+    def _write_signal(self, target: int, volume: float) -> int:
+        """Publish the wanted position. Atomic, so the EA never reads a torn row."""
+        signal_id = self._next_id
+        self._next_id += 1
+        tmp = self.signal_path + ".tmp"
+        stamp = int(_time.time() + self._server_offset)
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write("id,time,symbol,target,volume\n")
+            fh.write(f"{signal_id},{stamp},{self.symbol},{target},{volume:.2f}\n")
+        os.replace(tmp, self.signal_path)
+        return signal_id
+
+    def _goto(self, target: int, volume: float, when) -> Optional[Fill]:
+        """Ask the EA for a net position and wait until the account shows it."""
+        before = self.get_position(self.symbol)
+        if before.side == target:
+            return None                       # already there; nothing to execute
+
+        signal_id = self._write_signal(target, volume if target else before.volume)
+        deadline = _time.time() + self.wait_sec
+        status = None
+        while _time.time() < deadline:
+            _time.sleep(self.poll_sec)
+            try:
+                status = self._read_status()
+            except BridgeError:
+                continue
+            if int(self._num(status, "pos_side")) == target:
+                break
+            err = status.get("error", "")
+            if err and int(self._num(status, "last_signal_id", -1)) == signal_id:
+                raise BridgeError(f"EA rejected signal {signal_id}: {err}")
+        else:
+            raise BridgeError(
+                f"EA did not reach position {target:+d} within {self.wait_sec:.0f}s "
+                f"(signal {signal_id}). Is AutoTrading on and the market open?"
+            )
+
+        fill_price = self._num(status, "last_price")
+        fill_time = self._server_time(status, "last_time") or when
+
+        # A flip is one signal but two events: book the close, then the open.
+        if before.side != 0:
+            self.fills.append(Fill(
+                fill_time, self.symbol, "close", before.volume, fill_price,
+                realized_pnl=self._num(status, "close_profit"),
+                side=before.side,
+                entry_price=self._num(status, "close_entry") or before.entry_price,
+                entry_time=self._server_time(status, "close_opened") or before.entry_time,
+            ))
+        if target == 0:
+            return self.fills[-1] if self.fills else None
+
+        fill = Fill(fill_time, self.symbol, "open_long" if target == 1 else "open_short",
+                    self._num(status, "pos_volume") or volume, fill_price, side=target)
+        self.fills.append(fill)
+        return fill

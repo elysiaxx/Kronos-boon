@@ -357,9 +357,13 @@ _PAGE_JS = r"""
       { label: "Thời gian trong thị trường", en: "exposure", value: fmt(S.exposure_pct, 0) + "%",
         note: `${S.n_decisions} nến đã xử lý`
               + (S.span_hours ? `, trải ${fmt(S.span_hours, 1)} giờ.` : ".") },
-      { label: "Spread đã trả", en: "spread cost", value: fmt(S.spread_paid, 2),
-        note: SES.spread > 0 ? `${fmt(SES.spread, 2)} đơn vị giá mỗi vòng, đã trừ khỏi lãi.`
-                             : "Chưa khai báo spread — lãi đang bị thổi phồng." },
+      (SES.broker === "paper"
+        ? { label: "Spread đã trả", en: "spread cost", value: fmt(S.spread_paid, 2),
+            note: SES.spread > 0 ? `${fmt(SES.spread, 2)} đơn vị giá mỗi vòng, đã trừ khỏi lãi.`
+                                 : "Chưa khai báo spread — lãi đang bị thổi phồng." }
+        : { label: "Chi phí giao dịch", en: "costs", value: "theo sàn",
+            note: "Spread, slippage, commission và phí qua đêm đã nằm trong lãi lỗ "
+                  + "từng lệnh do sàn báo về." }),
     ];
     document.getElementById("tiles").innerHTML = list.map(t => `
       <div class="tile">
@@ -470,6 +474,11 @@ def build_html(data: dict) -> str:
         paper_note = ("Đây là lệnh mô phỏng: khớp ngay tại giá đóng nến, không trượt giá, "
                       "không phí qua đêm, không bị từ chối lệnh. Tài khoản demo thật sẽ "
                       "khớp kém hơn một chút.")
+    elif broker == "file":
+        broker_note = ("Lệnh được <b>đặt thật</b> trên tài khoản bởi EA "
+                       "<code>KronosTrader.mq5</code> trong terminal MT5.")
+        paper_note = ("Lãi lỗ ở đây lấy thẳng từ deal của sàn, nên đã gồm spread, slippage, "
+                      "commission và phí qua đêm thật.")
     else:
         broker_note = f"Lệnh được <b>gửi thật</b> lên tài khoản MT5 qua feed <code>{feed}</code>."
         paper_note = "Số liệu lấy từ tài khoản MT5, đã gồm điều kiện khớp lệnh thật của sàn."
@@ -483,7 +492,7 @@ def build_html(data: dict) -> str:
     ])
 
     spread_warn = ""
-    if not session.get("spread"):
+    if broker == "paper" and not session.get("spread"):
         spread_warn = (
             '<div class="card"><p class="caveat warn" style="margin:0">'
             '<b>Chưa tính spread.</b> Phiên này chạy với <code>--spread 0</code>, nghĩa là mọi lệnh '

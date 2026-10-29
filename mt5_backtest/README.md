@@ -144,8 +144,13 @@ equity.
 
 Có 2 trục độc lập:
 
-* **Lệnh** — `--broker paper` (mặc định) mô phỏng lệnh trong bộ nhớ, **không
-  gửi gì**; `--broker mt5` gửi lệnh thật qua `order_send` (chỉ Windows).
+* **Lệnh** — `--broker` quyết định lệnh đi đâu:
+
+  | `--broker` | Lệnh đi đâu | Chạy được trên |
+  |---|---|---|
+  | `paper` (mặc định) | mô phỏng trong bộ nhớ, **không gửi gì** | mọi hệ điều hành |
+  | `file` | **lệnh thật**, do EA `KronosTrader.mq5` đặt trong terminal | macOS / Linux / Windows |
+  | `mt5` | **lệnh thật**, qua `order_send` của package Python | chỉ Windows |
 * **Dữ liệu** — `--feed` chọn nến ở đâu ra:
 
   | `--feed` | Nguồn nến | Chạy được trên | Cần gì |
@@ -161,16 +166,57 @@ Có 2 trục độc lập:
 
 ### Trên macOS
 
-Package `MetaTrader5` không có bản macOS, nên `--broker mt5` **không chạy được
-native trên Mac** — nhưng bạn vẫn đo được lãi/lỗ thật: lấy giá live từ tài
-khoản demo qua cầu nối file, còn lệnh thì mô phỏng. Chênh lệch so với demo thật
-chỉ là slippage và việc khớp lệnh, đã ghi rõ trong báo cáo.
+**Terminal MT5 cài được trên Mac** (bản "MetaTrader 5 for Mac" của sàn, đóng gói
+Wine). Thứ không có bản macOS là **thư viện Python `MetaTrader5`** — PyPI chỉ có
+wheel Windows:
+
+```
+$ pip download MetaTrader5 --no-deps
+ERROR: Could not find a version that satisfies the requirement MetaTrader5 (from versions: none)
+```
+
+Nên `--broker mt5` / `--feed mt5` (gọi thẳng API Python) không dùng được trên
+Mac. Đường vòng là để **terminal tự làm phần của terminal**: Python ghi file,
+MQL5 đọc file. Có 2 mức:
+
+**(a) Lệnh thật trên tài khoản demo** — `--broker file`:
+
+```
+Kronos (Python native, có MPS)
+  ├── đọc nến  ◀── kronos_bars.csv   ◀── KronosExport.mq5
+  └── ghi tín hiệu ─▶ kronos_signal.csv ─▶ KronosTrader.mq5 ─▶ OrderSend()
+                      kronos_status.csv ◀─ (tài khoản, vị thế, lãi lỗ từng deal)
+```
 
 ```bash
-# Bước 1 (một lần): cài KronosExport.mq5 vào chart XAUUSD M15 — xem mục 7 & 8.
+# Một lần: cài KronosExport.mq5 + KronosTrader.mq5 (mục 7), bật AutoTrading.
 COMMON=$(python -m mt5_backtest.mt5_visualize --find_mt5 | head -1)
 
-# Bước 2: chạy forward-test trên giá demo thật, trong 24 giờ.
+python -m mt5_backtest.live_demo --broker file --feed file \
+    --bars_csv "$COMMON/Files/kronos_bars.csv" \
+    --symbol XAUUSD --timeframe M15 \
+    --lookback 400 --pred_len 24 --eval_horizon 8 --threshold_pct 0.15 \
+    --volume 0.01 --contract_size 100 \
+    --duration_min 1440 --flatten_on_exit
+```
+
+Ở chế độ này **không cần `--spread`**: spread, slippage, commission và phí qua
+đêm đã nằm trong lãi lỗ từng deal mà sàn báo về.
+
+Tín hiệu gửi đi là **vị thế mong muốn** (+1 long, −1 short, 0 flat), không phải
+"lệnh". EA kéo tài khoản về đúng trạng thái đó, nên một tín hiệu bị đọc 2 lần
+hay đọc lại sau khi khởi động lại cũng không bao giờ nhân đôi vị thế.
+
+Chốt an toàn hai lớp: EA từ chối tài khoản **real** trừ khi bật `InpAllowReal`,
+*và* phía Python cũng từ chối trừ khi có `--allow_real`. EA còn chặn khối lượng
+vượt `InpMaxVolume`, bỏ qua tín hiệu cũ quá `InpMaxSignalAgeSec`, và chỉ động
+vào vị thế mang đúng `InpMagic` của nó.
+
+**(b) Chỉ mô phỏng lệnh, giá vẫn thật** — `--broker paper --feed file`. Nhanh
+hơn để bắt đầu (không cần EA đặt lệnh, không cần bật AutoTrading), và vì phần
+dự báo giống hệt, nó đủ để **đo chất lượng mô hình**:
+
+```bash
 python -m mt5_backtest.live_demo --broker paper --feed file \
     --bars_csv "$COMMON/Files/kronos_bars.csv" \
     --symbol XAUUSD --timeframe M15 \
@@ -272,12 +318,24 @@ Python dự báo rồi ghi file CSV vào thư mục **Common\Files** của MT5; 
 đọc file đó và vẽ **đường giá đóng cửa dự báo, nến dự báo, dải high/low** nối
 dài sang phải (tương lai), cùng một vạch dọc đánh dấu điểm bắt đầu dự báo.
 
-### Cài indicator (một lần)
+### Cài indicator / EA (một lần)
 
 1. Mở **MetaEditor** (nút trên MT5, hoặc F4).
-2. Copy `mt5_backtest/mql5/KronosForecast.mq5` vào thư mục
-   `MQL5/Indicators/` (trong MetaEditor: chuột phải *Indicators → Open Folder*).
-3. Chọn file và bấm **Compile** (F7) — ra `KronosForecast.ex5`.
+2. Copy file vào **đúng thư mục** — indicator và EA nằm ở hai chỗ khác nhau:
+
+   | File | Thư mục | Việc của nó |
+   |---|---|---|
+   | `KronosForecast.mq5` | `MQL5/Indicators/` | vẽ dự báo lên chart |
+   | `KronosExport.mq5` | `MQL5/Indicators/` | xuất nến ra CSV cho Python |
+   | `KronosTrader.mq5` | `MQL5/Experts/` | **đặt lệnh** theo tín hiệu của Python |
+
+   Trong MetaEditor: chuột phải *Indicators* (hoặc *Expert Advisors*) →
+   *Open Folder*.
+3. Chọn từng file và bấm **Compile** (F7) — ra file `.ex5` tương ứng.
+4. Riêng `KronosTrader.mq5`: kéo từ *Navigator → Expert Advisors* vào chart, và
+   **bật nút AutoTrading** trên thanh công cụ. Nếu AutoTrading tắt, EA báo lại
+   qua file status và phía Python sẽ dừng ngay với thông báo rõ ràng thay vì
+   chạy câm.
 
 ### Chạy
 
@@ -387,13 +445,11 @@ python -m mt5_backtest.live_demo --broker paper --feed file \
 
 ### Còn lại gì?
 
-* **Vẽ dự báo, backtest và forward-test trên Mac: chạy đầy đủ** bằng cầu nối
-  file ở trên.
-* **Đặt lệnh tự động (`order_send`) trên Mac:** cần package Windows-only, nên
-  phải chạy vòng giao dịch trên **Windows VM/VPS**, hoặc viết một EA MQL5 đọc
-  file tín hiệu rồi tự đặt lệnh (thuần trong terminal, không cần Python). Nói
-  một tiếng nếu bạn muốn mình làm EA đó.
+Trên Mac giờ chạy được **cả bốn**: vẽ dự báo, backtest, forward-test mô phỏng,
+và **đặt lệnh thật trên tài khoản demo** — tất cả qua cầu nối file, Kronos vẫn
+chạy native với MPS.
 
-  Khác biệt giữa `--broker paper` trên giá demo và lệnh thật gửi lên demo chỉ
-  là slippage, phí qua đêm và khả năng bị từ chối lệnh — phần dự báo và tín
-  hiệu thì giống hệt, nên để **đo chất lượng mô hình** thì paper là đủ.
+Thứ duy nhất không chạy được native là `--broker mt5` / `--feed mt5`, vì chúng
+gọi thẳng package Python Windows-only. Nếu bạn muốn đúng hai cờ đó thì cần
+**Windows VM/VPS**; nhưng `--broker file --feed file` làm đúng việc tương
+đương, với lệnh thật trong cùng terminal.

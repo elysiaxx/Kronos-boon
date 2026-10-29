@@ -5,8 +5,11 @@ Each time a new bar closes, feed the last ``lookback`` bars to Kronos, turn
 the forecast into a long/short/flat signal, and act on it through a broker:
 
 * ``--broker paper`` (default)  simulate fills in memory, place nothing.
+* ``--broker file``             write the wanted position to a file that the
+                                ``KronosTrader.mq5`` expert advisor executes -
+                                real orders from macOS, DEMO by default.
 * ``--broker mt5``              send market orders to a running MT5 terminal
-                                (Windows only, DEMO account by default).
+                                through the Windows-only Python package.
 
 Bars can come from four feeds (see :mod:`mt5_backtest.live_feed`):
 
@@ -38,6 +41,11 @@ Offline dry-run on a CSV (no MT5 needed):
     python -m mt5_backtest.live_demo --broker paper --feed replay \
         --csv xauusd_m15.csv --symbol XAUUSD --timeframe M15 \
         --lookback 400 --pred_len 24 --eval_horizon 8 --threshold_pct 0.1
+
+Trade a DEMO account from macOS (EA places the orders):
+    python -m mt5_backtest.live_demo --broker file --feed file \
+        --bars_csv "$COMMON/kronos_bars.csv" --symbol XAUUSD --timeframe M15 \
+        --volume 0.01 --duration_min 1440 --flatten_on_exit
 
 Paper-trade the live market on macOS, via the MT5 file bridge:
     python -m mt5_backtest.live_demo --broker paper --feed file \
@@ -74,7 +82,7 @@ if _REPO_ROOT not in sys.path:
 from mt5_backtest.data_source import CSVDataSource, timeframe_minutes  # noqa: E402
 from mt5_backtest.live_feed import build_feed, wait_for_new_bar  # noqa: E402
 from mt5_backtest.strategy import SignalGenerator  # noqa: E402
-from mt5_backtest.trader import PaperBroker, MT5Broker  # noqa: E402
+from mt5_backtest.trader import PaperBroker, MT5Broker, FileSignalBroker  # noqa: E402
 from mt5_backtest.backtest import load_predictor  # noqa: E402
 
 PRICE_COLS = ["open", "high", "low", "close", "volume", "amount"]
@@ -299,7 +307,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--sample_count", type=int, default=1)
     p.add_argument("--seed", type=int, default=None)
     # broker / feed
-    p.add_argument("--broker", choices=["paper", "mt5"], default="paper")
+    p.add_argument("--broker", choices=["paper", "file", "mt5"], default="paper",
+                   help="paper: simulate. file: KronosTrader.mq5 places real orders "
+                        "(works on macOS). mt5: MetaTrader5 package (Windows).")
     p.add_argument("--feed", choices=["mt5", "file", "yahoo", "replay"], default="mt5",
                    help="mt5: terminal (Windows). file: CSV from KronosExport.mq5 (macOS). "
                         "yahoo: Yahoo Finance (no MT5). replay: offline CSV.")
@@ -307,6 +317,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--bars_csv", default=None,
                    help="bars CSV for --feed file (written by KronosExport.mq5)")
     p.add_argument("--yahoo_ticker", default="GC=F", help="ticker for --feed yahoo")
+    p.add_argument("--signal_csv", default=None,
+                   help="signal file for --broker file (default: beside --bars_csv)")
+    p.add_argument("--status_csv", default=None,
+                   help="status file written by KronosTrader.mq5 (default: beside --bars_csv)")
+    p.add_argument("--order_wait_sec", type=float, default=20.0,
+                   help="how long to wait for the EA to reach the requested position")
     p.add_argument("--volume", type=float, default=0.01, help="lot size per trade")
     p.add_argument("--spread", type=float, default=0.0,
                    help="bid/ask spread in price units for paper fills (XAUUSD demo: ~0.30). "
@@ -335,12 +351,23 @@ def main(argv=None):
 
     if args.broker == "mt5" and args.feed != "mt5":
         raise SystemExit(
-            f"--broker mt5 requires --feed mt5; '{args.feed}' cannot place real orders.\n"
-            "On macOS the MetaTrader5 package is unavailable, so use --broker paper: "
-            "real demo prices in, simulated fills out."
+            f"--broker mt5 requires --feed mt5; '{args.feed}' cannot drive the Python API.\n"
+            "On macOS that package does not exist - use --broker file --feed file, "
+            "where KronosTrader.mq5 places the orders inside the terminal."
+        )
+    if args.broker == "file" and args.feed != "file":
+        raise SystemExit(
+            f"--broker file requires --feed file, not '{args.feed}'.\n"
+            "Orders go to your broker, so the prices the signal is built from must "
+            "come from the same terminal - not from Yahoo or a replayed CSV."
         )
     if args.feed == "replay" and not args.csv:
         raise SystemExit("--feed replay requires --csv <path>.")
+    if args.feed == "file" and not args.bars_csv:
+        raise SystemExit(
+            "--feed file requires --bars_csv <path> - the CSV KronosExport.mq5 writes.\n"
+            "Locate it with: python -m mt5_backtest.mt5_visualize --find_mt5"
+        )
     if args.broker == "paper" and args.spread <= 0:
         print("[warn] --spread 0: paper fills pay no bid/ask cost, so the P&L will be "
               "better than any broker could fill. For XAUUSD try --spread 0.30.")
@@ -359,9 +386,23 @@ def main(argv=None):
         top_k=args.top_k, sample_count=args.sample_count,
     )
 
+    currency = ""
     if args.broker == "paper":
         broker = PaperBroker(initial_cash=args.initial_cash, contract_size=args.contract_size,
                              spread=args.spread)
+    elif args.broker == "file":
+        bars_dir = os.path.dirname(os.path.abspath(args.bars_csv))
+        signal_path = args.signal_csv or os.path.join(bars_dir, "kronos_signal.csv")
+        status_path = args.status_csv or os.path.join(bars_dir, "kronos_status.csv")
+        broker = FileSignalBroker(signal_path, status_path, args.symbol,
+                                  contract_size=args.contract_size,
+                                  wait_sec=args.order_wait_sec,
+                                  allow_real=args.allow_real).connect()
+        status = broker._read_status()
+        currency = status.get("currency", "")
+        args.initial_cash = broker.initial_equity or args.initial_cash
+        print(f"[bridge] signal : {signal_path}")
+        print(f"[bridge] status : {status_path}")
     else:
         broker = MT5Broker(login=args.mt5_login, password=args.mt5_password,
                            server=args.mt5_server, terminal_path=args.mt5_path,
@@ -382,6 +423,7 @@ def main(argv=None):
         "broker": args.broker, "feed": args.feed, "model": args.model,
         "volume": args.volume, "spread": args.spread,
         "contract_size": args.contract_size, "initial_cash": args.initial_cash,
+        "currency": currency,
         "eval_horizon": args.eval_horizon, "threshold_pct": args.threshold_pct,
         "lookback": args.lookback, "pred_len": args.pred_len,
         "sample_count": args.sample_count, "seed": args.seed,
@@ -407,16 +449,17 @@ def main(argv=None):
     session["decisions"] = steps
     session["final_equity"] = equity
     print(f"\n[done] decisions={steps}  final equity={equity:.2f}")
-    if isinstance(broker, PaperBroker):
+    if getattr(broker, "fills", None) is not None:
         closes = [f for f in broker.fills if f.action == "close"]
         wins = sum(1 for f in closes if f.realized_pnl > 0)
-        ret_pct = (equity - args.initial_cash) / args.initial_cash * 100
+        ret_pct = (equity - args.initial_cash) / args.initial_cash * 100 if args.initial_cash else float("nan")
+        spread_paid = getattr(broker, "spread_paid", 0.0)
         session.update(closed_trades=len(closes), wins=wins,
                        net_pnl=equity - args.initial_cash, return_pct=ret_pct,
-                       spread_paid=broker.spread_paid)
+                       spread_paid=spread_paid)
         print(f"[done] closed trades={len(closes)}  wins={wins}  "
               f"hit_rate={(wins / len(closes) * 100) if closes else float('nan'):.1f}%  "
-              f"return={ret_pct:+.2f}%  spread paid={broker.spread_paid:.2f}")
+              f"return={ret_pct:+.2f}%" + (f"  spread paid={spread_paid:.2f}" if spread_paid else ""))
     _write_session(session_path, session)
     print(f"[done] trade log: {log_path}")
     print(f"[done] fills    : {fills_path}")
