@@ -234,11 +234,13 @@ def run_live(args, predictor, broker, logger, fills_log):
             if bars is None:
                 print("[live] duration reached; stopping.")
                 break
-            if len(bars) < args.lookback:
-                print(f"[live] only {len(bars)} bars available, need {args.lookback}; waiting...")
-                time.sleep(args.poll_sec)
-                continue
+            # Claim the bar before deciding whether we can use it: leaving
+            # last_bar_time behind would re-offer this same bar on every poll.
             last_bar_time = bar_time
+            if len(bars) < args.lookback:
+                print(f"[live] only {len(bars)} bars available, need {args.lookback}; "
+                      f"skipping bar {bar_time}", flush=True)
+                continue
 
             hist = bars.iloc[-args.lookback:]
             x_ts = hist["timestamps"]
@@ -348,6 +350,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv=None):
     global siggen
     args = build_arg_parser().parse_args(argv)
+
+    # A forward test is normally watched through `| tee run.log`, and a pipe
+    # makes stdout block-buffered - the loop would appear to print nothing for
+    # hours. Line buffering costs nothing here and keeps the log live.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:  # pragma: no cover - very old Python
+        pass
 
     if args.broker == "mt5" and args.feed != "mt5":
         raise SystemExit(

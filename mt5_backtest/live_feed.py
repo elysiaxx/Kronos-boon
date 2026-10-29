@@ -167,20 +167,33 @@ def build_feed(args):
 
 
 def wait_for_new_bar(feed, count: int, last_bar_time, poll_sec: float, deadline=None):
-    """Poll ``feed`` until its newest closed bar differs from ``last_bar_time``.
+    """Poll ``feed`` until it serves a bar STRICTLY NEWER than ``last_bar_time``.
+
+    Strictly newer, not merely different. A feed can serve stale data for a
+    while - Yahoo load-balances across nodes whose freshness differs, and the
+    MT5 bars file can be re-read mid-rewrite - and accepting "different" would
+    let an older bar, or one already traded, through. In a forward test that
+    books the same round trip twice and invents the profit, so time is only
+    ever allowed to move forward.
 
     Returns ``(bars, bar_time)``, or ``(None, last_bar_time)`` if ``deadline``
-    (a ``time.time()`` value) passed first. Transient feed errors are printed
-    and retried rather than killing a multi-day run.
+    (a ``time.time()`` value) passed first. Transient feed errors and stale
+    reads are reported and retried rather than killing a multi-day run.
     """
+    warned_stale = None
     while True:
         try:
             bars = feed.latest_closed_bars(count)
             bar_time = bars["timestamps"].iloc[-1]
-            if bar_time != last_bar_time:
+            if last_bar_time is None or bar_time > last_bar_time:
                 return bars, bar_time
+            if bar_time < last_bar_time and warned_stale != bar_time:
+                # Report once per distinct stale value, not once per poll.
+                warned_stale = bar_time
+                print(f"[feed] stale read: {bar_time} is older than the last bar "
+                      f"{last_bar_time}; ignoring and waiting for a newer one", flush=True)
         except FeedError as exc:
-            print(f"[feed] {exc}")
+            print(f"[feed] {exc}", flush=True)
         if deadline is not None and time.time() >= deadline:
             return None, last_bar_time
         time.sleep(poll_sec)
