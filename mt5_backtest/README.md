@@ -268,6 +268,18 @@ python -m mt5_backtest.backtest --source csv \
     --lookback 400 --pred_len 24 --n_windows 50
 ```
 
+**Chưa cài MT5 trên Mac?** Tải dữ liệu vàng miễn phí về CSV để test ngay (không
+cần MT5), qua Yahoo Finance:
+
+```bash
+pip install yfinance
+python -m mt5_backtest.fetch_gold_csv --ticker GC=F --interval 15m --period 60d --out gold_m15.csv
+python -m mt5_backtest.backtest --source csv --csv gold_m15.csv \
+    --symbol XAUUSD --timeframe M15 --lookback 400 --pred_len 24 --n_windows 50
+```
+(`GC=F` là hợp đồng tương lai vàng COMEX — xấp xỉ XAUUSD giao ngay; Yahoo giới
+hạn khung 15m ~60 ngày gần nhất.)
+
 ### Còn lại gì?
 
 * **Vẽ dự báo + backtest trên Mac: chạy đầy đủ** bằng cầu nối file ở trên.
